@@ -1,0 +1,68 @@
+{
+    "neutron.conf": {
+        "DEFAULT": {
+            "debug" : "True",
+            "verbose" : "True",
+            "notify_nova_on_port_status_changes" : "False",
+            "notify_nova_on_port_data_changes" : "False",
+            "lock_path" : "$state_path/lock",
+            "log_format" : "neutron-server %(levelname)s [pid:%(process)d] [%(threadName)s] [%(filename)s:%(lineno)d %(funcName)s] %(message)s",
+            "default_log_levels" : "amqp=WARN,amqplib=WARN,boto=WARN,eventlet.wsgi.server=WARN,keystone=INFO,qpid=WARN,sqlalchemy=WARN,suds=INFO,iso8601=WARN,keystoneclient=WARN,keystoneclient.common.cms=ERROR,routes.middleware=WARN,neutron.wsgi=WARN,oslo.messaging=INFO",
+            "use_syslog" : "True",
+            "syslog_log_facility" : "local1",
+            "core_plugin" : "neutron.plugins.ml2.plugin.Ml2Plugin",
+            "allow_overlapping_ips" : "True",
+            "rabbit_password" : "N8296FGj0gDK1OA8djBQ50u/7CZvJ+RfE2qNhiGICE8=",
+            "rabbit_userid": "rabbit",
+            "notification_driver" : "neutron.openstack.common.notifier.rpc_notifier",
+            "dhcp_agents_per_network" : "2",
+            "kombu_heartbeat" : "60",
+            "agent_down_time" : "150",
+            "rpc_response_timeout" : "600",
+            "rpc_conn_pool_size" : "20",
+            "api_workers" : "5",
+            "rpc_workers" : "5",
+            "max_fixed_ips_per_port" : "20",
+            "allow_pagination" : "True",
+            "isolate_relay_cidr" : "",
+            "cascading_os_region_name" : "",
+            "enable_vtep" : "True"
+        },
+        "quotas": {
+            "quota_router": "-1",
+            "quota_floatingip": "-1",
+            "quota_network": "-1",
+            "quota_subnet": "-1",
+            "quota_port": "-1",
+            "quota_security_group": "-1",
+            "quota_security_group_rule": "-1"
+        },
+        "keystone_authtoken": {
+            "admin_tenant_name": "service",
+            "admin_user": "neutron",
+            "admin_password": "N8296FGj0gDK1OA8djBQ50u/7CZvJ+RfE2qNhiGICE8=",
+            "signing_dir": "$state_path/keystone-signing",
+            "auth_version": "v2.0",
+            "insecure": "true",
+            "revocation_cache_time": "86400",
+            "auth_admin_prefix": "identity-admin"
+        },
+        "database": {
+            "max_pool_size" : "10",
+            "idle_timeout":"10"
+        }
+    },
+    "ml2_conf.ini": {
+        "ml2": {
+            "type_drivers" : "local,flat,vlan,gre,vxlan"
+        }
+    },
+    "ml2_conf_sriov.ini": {
+        "ml2_sriov": {
+            "agent_required": "True"
+        },
+        "qos": {
+            "sriov_qos_driver": "neutron.services.qos.drivers.sriov_qos.MixingSriovQoSDriver"
+        }
+    }
+}

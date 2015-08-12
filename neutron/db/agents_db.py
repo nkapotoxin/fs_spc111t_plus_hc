@@ -38,6 +38,10 @@ cfg.CONF.register_opt(
                       "least twice report_interval, to be sure the "
                       "agent is down for good.")))
 
+cfg.CONF.register_opt(
+    cfg.BoolOpt('enable_vtep', default=False,
+               help='use to enbale vtep function.'))
+
 class Agent(model_base.BASEV2, models_v2.HasId):
     """Represents agents running in neutron deployments."""
 
@@ -239,9 +243,11 @@ class AgentExtRpcCallback(n_rpc.RpcCallback):
         """Report state from agent to server."""
         time = kwargs['time']
         time = timeutils.parse_strtime(time)
-        if self.START_TIME > time:
-            LOG.debug(_("Message with invalid timestamp received"))
-            raise ext_agent.AgentInvalidTimestamp()
+        opt_enable_vetp = cfg.CONF.enable_vetp
+        if not opt_enable_vetp:
+            if self.START_TIME > time:
+                LOG.debug(_("Message with invalid timestamp received"))
+                raise ext_agent.AgentInvalidTimestamp()
         agent_state = kwargs['agent_state']['agent_state']
         if not self.plugin:
             self.plugin = manager.NeutronManager.get_plugin()

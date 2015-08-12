@@ -200,6 +200,17 @@ class RpcCallbacks(n_rpc.RpcCallback,
         port_bound = plugin.port_bound_to_router(rpc_context, port_id, host)
         return port_bound
 
+    def port_bound_to_host(self, rpc_context, **kwargs):
+        agent_id = kwargs.get('agent_id')
+        host = kwargs.get('host')
+        port_id = kwargs.get('port_id')
+        LOG.debug("Port %(port_id)s bound to host %(host)s requested by agent "
+                  "%(agent_id)s",
+                  {'port_id':port_id, 'host': host, 'agent_id': agent_id})
+        plugin = manager.NeutronManager.get_plugin()
+        port_bound = plugin.port_bound_to_host(rpc_context, port_id, host)
+        return port_bound
+
     def update_device_down(self, rpc_context, **kwargs):
         """Device no longer exists on agent."""
         # TODO(garyk) - live migration and port status
@@ -269,6 +280,70 @@ class RpcCallbacks(n_rpc.RpcCallback,
         dhcp_ports = plugin.get_ports(rpc_context, filter)
         return {'subnets': subnets,
                 'dhcp_ports': dhcp_ports}
+    def get_user_port_id_from_vm_port(self, vm_port):
+        name = vm_port['name']
+        n_list = name.split('@')
+        if(len(n_list) > 1 and u'vm_port' == n_list[0] and len(n_list[1]) > 1):
+            return n_list[1]
+        else:
+            return u''
+
+    def get_cidr_and_gwip_by_subnet_id(self, context, subnet_id):
+        plugin = manager.NeutronManager.get_plugin()
+        subnet = plugin.get_subnet(context, subnet_id)
+        if not subnet:
+            LOG.debug(_('HYBRID: Subnet not found, subnet_id: %s.'
+                        ), subnet_id)
+            return ''
+        return [subnet['cidr'], subnet['gateway_ip']]
+
+    def get_ip_addresses_from_fixed_ips(self, context, fixed_ips):
+        if(len(fixed_ips) <= 0):
+            return None
+        ip_list = []
+        for fixed_ip in fixed_ips:
+            ip_address = fixed_ip.get('ip_address')
+            subnet_id = fixed_ip.get('subnet_id')
+            ip_cidr_gwip = self.get_cidr_and_gwip_by_subnet_id(context,
+                                                               subnet_id)
+            ip_list.append([ip_address, ip_cidr_gwip[0], ip_cidr_gwip[1]])
+        return ip_list
+#         if(len(fixed_ips) > 0):
+#             return fixed_ips[0].get('ip_address', '')
+
+    def get_user_address(self, rpc_context, **kwargs):
+        mac = kwargs.get('mac_address')
+        ip = kwargs.get('ip_address')
+        host = kwargs.get('host')
+        LOG.debug("HYBRID: Agent requests user address of VM on host: %s, "
+                  "ip_address: %s, mac_address: %s", host, ip, mac)
+        plugin = manager.NeutronManager.get_plugin()
+        vm_port_id = plugin._device_to_port_id(mac)
+#         vm_port = plugin.get_port_from_device([vm_port_id])
+        vm_port = plugin.get_port(rpc_context, vm_port_id)
+        if not vm_port:
+            LOG.debug(_('HYBRID: VM port not found, host: %s, ip_address: %s,'
+                        'mac_address: %s.'), host, ip, mac)
+            return {'user_port': {}}
+        user_port_id = self.get_user_port_id_from_vm_port(vm_port)
+        user_port = plugin.get_port(rpc_context, user_port_id)
+#         user_port = plugin.get_port_from_device(user_port_id)
+        if not user_port:
+            LOG.debug(_('HYBRID: User port not found, host: %s, ip_address: '
+                        '%s, mac_address: %s.'), host, ip, mac)
+            return {'user_port': {}}
+        ip_addresses = self.get_ip_addresses_from_fixed_ips(
+                                        rpc_context, user_port['fixed_ips'])
+        user_port['binding:host_id'] = host
+        port = {'port': user_port}
+        plugin.update_port(rpc_context, user_port_id, port)
+        ret_msg = {'user_port': {
+                   'mac_address': user_port['mac_address'],
+                   'ip_addresses': ip_addresses,
+                   'port_id': user_port['id'],
+                   'vm_port_id': vm_port_id}}
+        LOG.debug(_('HYBRID: Get user port, return msg %s.'), ret_msg)
+        return ret_msg
 
 
 class AgentNotifierApi(n_rpc.RpcProxy,

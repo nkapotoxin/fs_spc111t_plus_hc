@@ -149,6 +149,24 @@ class OVSBridge(BaseOVS):
                         port_name])
         return self.get_port_ofport(port_name)
 
+#     added by jiahaojie 00209498
+    def add_ovs_user_port(self, dev, iface_id, mac, vm_port_id):
+        mac_list = mac.split(':')
+        mac_str = '\:'.join(mac_list)
+        self.run_vsctl(['--', '--if-exists', 'del-port', dev, '--',
+                        'add-port', self.br_name, dev,
+                        '--', 'set', 'Interface', dev, 'type=internal',
+                        '--', 'set', 'Interface', dev,
+                        'mac=%s' % mac_str,
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:iface-id=%s' % iface_id,
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:iface-status=active',
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:attached-mac=%s' % mac,
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:vm-port-id=%s' % vm_port_id])
+
     def delete_port(self, port_name):
         self.run_vsctl(["--", "--if-exists", "del-port", self.br_name,
                         port_name])

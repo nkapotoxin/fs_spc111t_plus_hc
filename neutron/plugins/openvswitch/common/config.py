@@ -59,6 +59,19 @@ ovs_opts = [
     cfg.BoolOpt('use_veth_interconnection', default=False,
                 help=_("Use veths instead of patch ports to interconnect the "
                        "integration bridge to physical bridges.")),
+
+    #added by jiahaojie 00209498
+    cfg.StrOpt('user_interface_driver',
+               default='neutron.agent.linux.interface.OVSInterfaceDriver',
+               help='Driver used to create user devices.'),
+    cfg.StrOpt('vm_interface',
+               default='eth0',
+               help='Visual Machine Device used to get user port.'),
+    cfg.IntOpt('vm_device_mtu', default=1350,
+               help=_('MTU setting for device.')),
+    cfg.BoolOpt('enable_vtep',
+               default=False,
+               help='use to enbale vtep function.'),
 ]
 
 agent_opts = [

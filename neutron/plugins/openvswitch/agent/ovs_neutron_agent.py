@@ -61,10 +61,17 @@ LOG = logging.getLogger(__name__)
 DEAD_VLAN_TAG = str(q_const.MAX_VLAN_TAG + 1)
 Agent_Start_Report_Retry_Interval = 2
 
+cfg.CONF.register_opt(
+    cfg.BoolOpt('enable_vtep', default=False,
+               help='use to enbale vtep function.'))
 
 class DeviceListRetrievalError(exceptions.NeutronException):
     message = _("Unable to retrieve port details for devices: %(devices)s "
                 "because of error: %(error)s")
+
+
+class AgentError(exceptions.NeutronException):
+    msg_fmt = _('Error during following call to agent: %(method)s')
 
 
 # A class to represent a VIF (i.e., a port that has 'iface-id' and 'vif-mac'
@@ -86,6 +93,17 @@ class LocalVLANMapping:
         return ("lv-id = %s type = %s phys-net = %s phys-id = %s" %
                 (self.vlan, self.network_type, self.physical_network,
                  self.segmentation_id))
+
+
+class VmPort:
+    def __init__(self, mac, ip_address=None):
+        self.mac_address = mac
+        if(not ip_address):
+            self.ip_address = set()
+        else:
+            self.ip_address = set()
+            self.ip_address.add(ip_address)
+
 
 
 class VLANBridge(ovs_lib.OVSBridge):
@@ -419,12 +437,145 @@ class OVSNeutronAgent(n_rpc.RpcCallback,
         self.sg_agent = OVSSecurityGroupAgent(self.context,
                                               self.plugin_rpc,
                                               root_helper)
+
+#       added by jiahaojie 00209498  ---begin
+        opt_enable_vetp = cfg.CONF.enable_vetp
+        if not opt_enable_vetp:
+            self.vm_port = {}
+            self.controlling_vm_base_network()
+            self.get_user_port_from_server()
+#       added by jiahaojie 00209498  ---end
+
         self.init_qos()
         self.init_ovs_bus()
 
         # Initialize iteration counter
         self.iter_num = 0
         self.run_daemon_loop = True
+        self.is_distributed_dhcp = cfg.CONF.dhcp_distributed
+        LOG.debug('myOVSNeutronAgent:%s', self.is_distributed_dhcp)
+
+    def setup_interface_driver(self):
+        if not cfg.CONF.OVS.user_interface_driver:
+            msg = _('An interface driver must be specified')
+            LOG.error(msg)
+            raise SystemExit(1)
+        try:
+            self.driver = importutils.import_object(
+                cfg.CONF.OVS.user_interface_driver)
+        except Exception as e:
+            msg = (_("Error importing interface driver '%(driver)s': "
+                   "%(inner)s") % {'driver': cfg.CONF.OVS.user_interface_driver,
+                                   'inner': e})
+            LOG.error(msg)
+            raise SystemExit(1)
+
+    def get_vm_interface_mac(self):
+        dev = cfg.CONF.OVS.vm_interface
+        LOG.debug(_('HYBRID: Begin to get vm interface %s.'), dev)
+        device = ip_lib.IPDevice(dev,
+                                 self.root_helper)
+        mac_address = device.link.address
+        if(not mac_address):
+            LOG.error('HYBRID: VM Interface %s can not get mac_address', dev)
+            raise SystemExit(1)
+        self.vm_port[mac_address] = VmPort(mac=mac_address)
+
+    def controlling_vm_base_network(self):
+        '''Maybe scan all interface and select one device to get vm mac,
+        But now only get one interface mac_address from config file'''
+        self.get_vm_interface_mac()
+
+    def get_user_port_from_server(self):
+        LOG.debug(_('HYBRID: Start call get_user_port_from_server.'
+                    'all ports: %s.'), self.vm_port)
+        for mac, vport in self.vm_port.items():
+            if not vport:
+                continue
+            if len(vport.ip_address) > 0:
+                ip_address = list(vport.ip_address)[0]
+            else:
+                ip_address = ''
+            user_port = {}
+            call_time = 0
+            while(True):
+                call_time = call_time + 1
+                try:
+                    LOG.debug(_('HYBRID: Call rpc get_user_address, mac:%s,'
+                                'ip_address:%s at %s times, host: %s.'), mac,
+                              ip_address, str(call_time), cfg.CONF.host)
+                    user_port = self.plugin_rpc.get_user_address(self.context,
+                                                                 mac,
+                                                                 ip_address,
+                                                                 cfg.CONF.host)
+                except Exception:
+                    continue
+                if(user_port and not user_port.get('user_port', None)):
+                    continue
+                else:
+                    break
+            self.config_user_port(user_port)
+
+    def config_user_port(self, user_port):
+        LOG.debug(_('HYBRID: start config user port %s.'), user_port)
+        if(user_port and not user_port.get('user_port', None)):
+            return
+        mac_address = user_port['user_port'].get('mac_address', None)
+        ip_addresses = user_port['user_port'].get('ip_addresses', None)
+        ip_cidr = user_port['user_port'].get('ip_cidr', None)
+        port_id = user_port['user_port'].get('port_id', None)
+        vm_port_id = user_port['user_port'].get('vm_port_id', None)
+        if(mac_address and ip_addresses and port_id):
+            dev = 'user_' + port_id[0:8]
+            self.int_br.add_ovs_user_port(dev,
+                                          port_id,
+                                          mac_address,
+                                          vm_port_id)
+            self.set_device_mtu(dev)
+            self.config_user_port_ip(dev, ip_addresses, ip_cidr)
+
+    def set_device_mtu(self, dev, mtu=None):
+        """Set the device MTU."""
+        if not mtu:
+            mtu = cfg.CONF.OVS.vm_device_mtu
+        LOG.debug(_('HYBRID: start config mtu %s for user port %s.'),
+                  dev, mtu)
+        device = ip_lib.IPDevice(dev,
+                                 self.root_helper)
+        device.link.set_mtu(mtu)
+
+    def config_user_port_ip(self, dev, ip_addresses, ip_cidr,
+                            preserve_ips=[]):
+        LOG.debug(_('HYBRID: start config ip %s for user port %s.'),
+                  dev, ip_addresses)
+        device = ip_lib.IPDevice(dev,
+                                 self.root_helper)
+        previous = {}
+        gw_ip = None
+        for address in device.addr.list(scope='global', filters=['permanent']):
+            previous[address['cidr']] = address['ip_version']
+        for ip_address in ip_addresses:
+            ip_addr = ip_address[0]
+            cidr = ip_address[1]
+            gw_ip = ip_address[2]
+            prefixlen = netaddr.IPNetwork(cidr).prefixlen
+            ip_cidr = "%s/%s" % (ip_addr, prefixlen)
+            net = netaddr.IPNetwork(ip_cidr)
+            if net.version == 6:
+                ip_cidr = str(net)
+            if ip_cidr in previous:
+                del previous[ip_cidr]
+                continue
+
+            device.addr.add(net.version, ip_cidr, str(net.broadcast))
+ 
+        if gw_ip:
+            device.route.add_gateway(gw_ip)
+
+        # clean up any old addresses
+        for ip_cidr_one, ip_version in previous.items():
+            if ip_cidr_one not in preserve_ips:
+                device.addr.delete(ip_version, ip_cidr_one)
 
     def init_ovs_bus(self):
         try:

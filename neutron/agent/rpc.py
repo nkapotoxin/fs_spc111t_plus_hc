@@ -137,6 +137,11 @@ class PluginApi(n_rpc.RpcProxy):
                          self.make_msg('port_bound_to_router', port_id=port_id,
                                        agent_id=agent_id, host=host))
 
+    def port_bound_to_host(self, context, port_id, agent_id, host):
+        return self.call(context,
+                         self.make_msg('port_bound_to_host', port_id=port_id,
+                                       agent_id=agent_id, host=host))
+
     def update_device_down(self, context, device, agent_id, host=None):
         return self.call(context,
                          self.make_msg('update_device_down', device=device,
@@ -159,3 +164,12 @@ class PluginApi(n_rpc.RpcProxy):
     def get_networks(self, context, agent_id, network_id):
         return self.call(context,
                          self.make_msg('get_networks', agent_id=agent_id, network_id=network_id))
+
+    def get_user_address(self, context, mac_address, ip_address, host):
+        return self.call(context,
+                         self.make_msg(
+                             'get_user_address',
+                             mac_address=mac_address,
+                             ip_address=ip_address,
+                             host=host),
+                         version=self.DVR_RPC_VERSION)

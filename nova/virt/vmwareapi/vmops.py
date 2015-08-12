@@ -57,19 +57,10 @@ from nova.virt.vmwareapi import vm_util
 from nova.virt.vmwareapi import vmware_images
 from nova.huawei import exception as huawei_exception
 
-vmware_imagecache_opts = [
-    cfg.StrOpt('vmware_image_cache_subdirectory_name',
-               default='vmware_base',
-               help='Where cached images are stored under $instances_path. '
-                    'This is NOT the full path - just a folder name. '
-                    'For per-compute-host cached images, set to _base_$my_ip'),
-    cfg.BoolOpt('vmware_remove_unused_base_images',
-                default=False,
-                help='Should unused base images be removed?'),
-    ]
 
 CONF = cfg.CONF
-CONF.register_opts(vmware_imagecache_opts)
+CONF.import_opt('image_cache_subdirectory_name', 'nova.virt.imagecache')
+CONF.import_opt('remove_unused_base_images', 'nova.virt.imagecache')
 CONF.import_opt('vnc_enabled', 'nova.vnc')
 CONF.import_opt('my_ip', 'nova.netconf')
 
@@ -159,12 +150,12 @@ class VMwareVMOps(object):
         self._cluster = cluster
         self._datastore_regex = datastore_regex
         # Ensure that the base folder is unique per compute node
-        if CONF.vmware_remove_unused_base_images:
+        if CONF.remove_unused_base_images:
             self._base_folder = '%s%s' % (CONF.my_ip,
-                                          CONF.vmware_image_cache_subdirectory_name)
+                                          CONF.image_cache_subdirectory_name)
         else:
             # Aging disable ensures backward compatibility
-            self._base_folder = CONF.vmware_image_cache_subdirectory_name
+            self._base_folder = CONF.image_cache_subdirectory_name
         self._tmp_folder = 'vmware_temp'
         self._default_root_device = 'vda'
         self._rescue_suffix = '-rescue'
@@ -874,7 +865,7 @@ class VMwareVMOps(object):
         msg = _("unpause not supported for vmwareapi")
         raise NotImplementedError(msg)
 
-    def suspend(self, context,instance):
+    def suspend(self, instance):
         """Suspend the specified instance."""
         vm_ref = vm_util.get_vm_ref(self._session, instance)
         pwr_state = self._session._call_method(vim_util,
@@ -975,16 +966,7 @@ class VMwareVMOps(object):
 
         :param instance: nova.objects.instance.Instance
         """
-        vm_ref = vm_util.get_vm_ref(self._session, instance)
-        pwr_state = self._session._call_method(vim_util,
-                    "get_dynamic_property", vm_ref,
-                    "VirtualMachine", "runtime.powerState")
-        # Only non-poweredOff VMs can be poweredOff.
-        if pwr_state != "poweredOff":
-            vm_util.power_off_instance(self._session, instance)
-        else:
-            LOG.debug("VM was already in poweredOff state. So returning "
-                      "without doing anything", instance=instance)
+        vm_util.power_off_instance(self._session, instance)
 
     def power_on(self, instance):
         vm_util.power_on_instance(self._session, instance)
@@ -1374,7 +1356,7 @@ class VMwareVMOps(object):
         self._set_machine_id(client_factory, instance, network_info)
 
     def manage_image_cache(self, context, instances):
-        if not CONF.vmware_remove_unused_base_images:
+        if not CONF.remove_unused_base_images:
             LOG.debug("Image aging disabled. Aging will not be done.")
             return
 
