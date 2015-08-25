@@ -439,8 +439,8 @@ class OVSNeutronAgent(n_rpc.RpcCallback,
                                               root_helper)
 
 #       added by jiahaojie 00209498  ---begin
-        opt_enable_vetp = cfg.CONF.enable_vetp
-        if not opt_enable_vetp:
+        opt_enable_vtep = cfg.CONF.enable_vtep
+        if not opt_enable_vtep:
             self.vm_port = {}
             self.controlling_vm_base_network()
             self.get_user_port_from_server()

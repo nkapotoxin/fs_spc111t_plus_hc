@@ -243,8 +243,8 @@ class AgentExtRpcCallback(n_rpc.RpcCallback):
         """Report state from agent to server."""
         time = kwargs['time']
         time = timeutils.parse_strtime(time)
-        opt_enable_vetp = cfg.CONF.enable_vetp
-        if not opt_enable_vetp:
+        opt_enable_vtep = cfg.CONF.enable_vtep
+        if not opt_enable_vtep:
             if self.START_TIME > time:
                 LOG.debug(_("Message with invalid timestamp received"))
                 raise ext_agent.AgentInvalidTimestamp()
