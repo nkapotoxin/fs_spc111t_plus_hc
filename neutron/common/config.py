@@ -161,6 +161,9 @@ core_opts = [
     cfg.BoolOpt('filter_vpn_router',
                 default=False,
                 help=_("whether filter vpn_router")),
+    cfg.BoolOpt('enable_vtep', 
+                default=False,
+                help='use to enbale vtep function.'),
 ]
 
 core_cli_opts = [

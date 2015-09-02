@@ -38,10 +38,6 @@ cfg.CONF.register_opt(
                       "least twice report_interval, to be sure the "
                       "agent is down for good.")))
 
-cfg.CONF.register_opt(
-    cfg.BoolOpt('enable_vtep', default=False,
-               help='use to enbale vtep function.'))
-
 class Agent(model_base.BASEV2, models_v2.HasId):
     """Represents agents running in neutron deployments."""
 
@@ -243,8 +239,8 @@ class AgentExtRpcCallback(n_rpc.RpcCallback):
         """Report state from agent to server."""
         time = kwargs['time']
         time = timeutils.parse_strtime(time)
-        opt_enable_vtep = cfg.CONF.enable_vtep
-        if not opt_enable_vtep:
+        #opt_enable_vtep = cfg.CONF.enable_vtep
+        if not cfg.CONF.enable_vtep:
             if self.START_TIME > time:
                 LOG.debug(_("Message with invalid timestamp received"))
                 raise ext_agent.AgentInvalidTimestamp()
