@@ -26,7 +26,7 @@
             "allow_pagination" : "True",
             "isolate_relay_cidr" : "",
             "cascading_os_region_name" : "",
-            "enable_vtep" : "True"
+            "enable_vtep" : "False"
         },
         "quotas": {
             "quota_router": "-1",

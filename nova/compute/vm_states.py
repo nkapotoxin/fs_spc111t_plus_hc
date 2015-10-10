@@ -40,7 +40,7 @@ RESIZED = 'resized'  # a VM with the new size is active. The user is expected
 SOFT_DELETED = 'soft-delete'  # VM is marked as deleted but the disk images are
 # still available to restore.
 DELETED = 'deleted'  # VM is permanently deleted.
-
+MIGRATING = 'migrating'
 ERROR = 'error'
 
 SHELVED = 'shelved'  # VM is powered off, resources still on hypervisor

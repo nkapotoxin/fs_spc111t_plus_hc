@@ -88,11 +88,31 @@ service_opts = [
                help='RBD stripe count to use when creating a backup image.'),
     cfg.BoolOpt('restore_discard_excess_bytes', default=True,
                 help='If True, always discard excess bytes when restoring '
-                     'volumes i.e. pad with zeroes.')
+                     'volumes i.e. pad with zeroes.'),
+    cfg.StrOpt('restore_ceph_conf', default='/etc/ceph/ceph.conf',
+               help='Ceph restore configuration file to use.'),
+    cfg.StrOpt('restore_ceph_user', default='cinder',
+               help='The Ceph restore user to connect with. Default here is to use '
+                    'the same user as for Cinder volumes. If not using cephx '
+                    'this should be set to None.'),
+    cfg.StrOpt('restore_ceph_pool', default='backups',
+               help='The Ceph pool where volume backups are stored.')
 ]
 
 CONF = cfg.CONF
 CONF.register_opts(service_opts)
+
+class RADOSClient(object):
+    """Context manager to simplify error handling for connecting to ceph."""
+    def __init__(self, driver, pool=None):
+        self.driver = driver
+        self.cluster, self.ioctx = driver._connect_to_restore_rados(pool)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type_, value, traceback):
+        self.driver._disconnect_from_rados(self.cluster, self.ioctx)
 
 
 class VolumeMetadataBackup(object):
@@ -185,6 +205,9 @@ class CephBackupDriver(BackupDriver):
         self._ceph_backup_user = strutils.safe_encode(CONF.backup_ceph_user)
         self._ceph_backup_pool = strutils.safe_encode(CONF.backup_ceph_pool)
         self._ceph_backup_conf = strutils.safe_encode(CONF.backup_ceph_conf)
+        self._ceph_restore_user = self._ceph_backup_user
+        self._ceph_restore_pool = self._ceph_backup_pool
+        self._ceph_restore_conf = self._ceph_backup_conf
 
     def _validate_string_args(self, *args):
         """Ensure all args are non-None and non-empty."""
@@ -241,6 +264,20 @@ class CephBackupDriver(BackupDriver):
         try:
             client.connect()
             pool_to_open = strutils.safe_encode(pool or self._ceph_backup_pool)
+            ioctx = client.open_ioctx(pool_to_open)
+            return client, ioctx
+        except self.rados.Error:
+            # shutdown cannot raise an exception
+            client.shutdown()
+            raise
+
+    def _connect_to_restore_rados(self, pool=None):
+        """Establish connection to the backup Ceph cluster."""
+        client = self.rados.Rados(rados_id=self._ceph_restore_user,
+                                  conffile=self._ceph_restore_conf)
+        try:
+            client.connect()
+            pool_to_open = strutils.safe_encode(pool or self._ceph_restore_pool)
             ioctx = client.open_ioctx(pool_to_open)
             return client, ioctx
         except self.rados.Error:
@@ -895,7 +932,7 @@ class CephBackupDriver(BackupDriver):
         This will result in all extents being copied from source to
         destination.
         """
-        with rbd_driver.RADOSClient(self, self._ceph_backup_pool) as client:
+        with RADOSClient(self, self._ceph_restore_pool) as client:
             # If a source snapshot is provided we assume the base is diff
             # format.
             if src_snap:
@@ -912,9 +949,9 @@ class CephBackupDriver(BackupDriver):
                                      snapshot=src_snap, read_only=True)
             try:
                 rbd_meta = rbd_driver.RBDImageMetadata(src_rbd,
-                                                       self._ceph_backup_pool,
-                                                       self._ceph_backup_user,
-                                                       self._ceph_backup_conf)
+                                                       self._ceph_restore_pool,
+                                                       self._ceph_restore_user,
+                                                       self._ceph_restore_conf)
                 rbd_fd = rbd_driver.RBDImageIOWrapper(rbd_meta)
                 self._transfer_data(rbd_fd, backup_name, dest_file, dest_name,
                                     length)
@@ -929,7 +966,7 @@ class CephBackupDriver(BackupDriver):
         shrink it to the size of the original backup so we need to
         post-process and resize it back to its expected size.
         """
-        with rbd_driver.RADOSClient(self, self._ceph_backup_pool) as client:
+        with RADOSClient(self, self._ceph_restore_pool) as client:
             adjust_size = 0
             base_image = self.rbd.Image(client.ioctx,
                                         strutils.safe_encode(backup_base),
@@ -941,7 +978,7 @@ class CephBackupDriver(BackupDriver):
                 base_image.close()
 
         if adjust_size:
-            with rbd_driver.RADOSClient(self, src_pool) as client:
+            with RADOSClient(self, src_pool) as client:
                 dest_image = self.rbd.Image(client.ioctx,
                                             strutils.safe_encode(restore_vol))
                 try:
@@ -962,10 +999,10 @@ class CephBackupDriver(BackupDriver):
                   {'base': base_name, 'snap': restore_point})
         before = time.time()
         try:
-            self._rbd_diff_transfer(base_name, self._ceph_backup_pool,
+            self._rbd_diff_transfer(base_name, self._ceph_restore_pool,
                                     restore_name, rbd_pool,
-                                    src_user=self._ceph_backup_user,
-                                    src_conf=self._ceph_backup_conf,
+                                    src_user=self._ceph_restore_user,
+                                    src_conf=self._ceph_restore_conf,
                                     dest_user=rbd_user, dest_conf=rbd_conf,
                                     src_snap=restore_point)
         except exception.BackupRBDOperationFailed:
@@ -1005,7 +1042,7 @@ class CephBackupDriver(BackupDriver):
         base has no snapshots/restore points), None is returned. Otherwise, the
         restore point associated with backup_id is returned.
         """
-        with rbd_driver.RADOSClient(self, self._ceph_backup_pool) as client:
+        with RADOSClient(self, self._ceph_restore_pool) as client:
             base_rbd = self.rbd.Image(client.ioctx, base_name, read_only=True)
             try:
                 restore_point = self._get_backup_snap_name(base_rbd, base_name,
@@ -1102,7 +1139,7 @@ class CephBackupDriver(BackupDriver):
         base_name = self._get_backup_base_name(backup['volume_id'],
                                                diff_format=True)
 
-        with rbd_driver.RADOSClient(self, self._ceph_backup_pool) as client:
+        with RADOSClient(self, self._ceph_restore_pool) as client:
             diff_allowed, restore_point = \
                 self._diff_restore_allowed(base_name, backup, volume,
                                            volume_file, client)
@@ -1148,6 +1185,15 @@ class CephBackupDriver(BackupDriver):
 
         If volume metadata is available this will also be restored.
         """
+        backup_des = backup.get('display_description', None)
+        if backup_des and backup_des.find('cross_az') >= 0:
+            self._ceph_restore_conf = strutils.safe_encode(CONF.restore_ceph_conf)
+            self._ceph_restore_pool = strutils.safe_encode(CONF.restore_ceph_pool)
+            self._ceph_restore_user = strutils.safe_encode(CONF.restore_ceph_user)
+        else:
+            self._ceph_restore_conf = self._ceph_backup_conf
+            self._ceph_restore_pool = self._ceph_backup_pool
+            self._ceph_restore_user = self._ceph_backup_user
         target_volume = self.db.volume_get(self.context, volume_id)
         LOG.debug('Starting restore from Ceph backup=%(src)s to '
                   'volume=%(dest)s' %

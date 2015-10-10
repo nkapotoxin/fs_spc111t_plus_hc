@@ -1372,6 +1372,7 @@ class ComputeManager(manager.Manager):
         syn_keypair_info(context, kp_name, kp_data, instance)
 
     def _heal_all_instances_state(self, context):
+        LOG.debug('begin time of _heal_all_instances_state is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         heal_interval = 60
         heal_finish_interval = 3600
         if not self.init_instance_finish:
@@ -1385,9 +1386,16 @@ class ComputeManager(manager.Manager):
         }
         servers = None
         try:
+            #add by liuling
+            if self.heal_all_instances_marker:
+                LOG.debug('begin list csd_server,marker is %s' %self.heal_all_instances_marker  )
             servers = sync_client.servers.list(search_opts=search_opts_args,
                                                limit=query_page_limit,
                                                marker=self.heal_all_instances_marker)
+            #add by liuling
+            if servers:  
+                for server in servers:
+                    LOG.debug('SERVER %s info is %s' %(server.id,str(server.__dict__)))
         except Exception as msg:
             LOG.error(_('servers list error,Exception:%s'), msg)
             self.heal_all_instances_marker = None
@@ -1405,6 +1413,13 @@ class ComputeManager(manager.Manager):
                     if self._change_since_time \
                             and self._change_since_time - datetime.timedelta(seconds=9) < updated:
                         ignore_server.append(csd_server.name)
+         
+                        #add by liuling
+                        _msg = _('ignore the instacne%s  heal state,the change_since_time is %s'
+                                   'the instance update time is %s') \
+                                    % (csd_server.name,str(self._change_since_time),str(updated_str))
+                        LOG.debug(_msg)
+                        
                         continue
                 csg_uuid = ComputeManager._extract_csg_uuid(csd_server)
                 if csg_uuid:
@@ -1414,11 +1429,13 @@ class ComputeManager(manager.Manager):
             LOG.error(_('heal instances error,Exception:%s'), str(traceback.format_exc()))
             return heal_interval
         self.heal_all_instances_marker = servers[-1].id
+        LOG.debug('end time of _heal_all_instances_state is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         return heal_interval
 
     @periodic_task.periodic_task(spacing=CONF.sync_instance_state_interval,
                                  run_immediately=True)
     def _heal_instances_state(self, context):
+        LOG.debug('begin time of _heal_instances_state is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         heal_interval = CONF.sync_instance_state_interval
         if not heal_interval:
             return
@@ -1439,10 +1456,14 @@ class ComputeManager(manager.Manager):
 
             marker = None
             while True:
+                LOG.debug('query server list of search_opts%s' %str(search_opts_args))
                 servers = sync_client.servers.list(search_opts=search_opts_args,
                                                    limit=self.QUERY_PER_PAGE_LIMIT, marker=marker)
 
                 if servers:
+                    #add by liuling
+                    for server in servers:
+                        LOG.debug('SERVER %s info is %s' %(server.id,str(server.__dict__)))
                     marker = servers[-1].id
                 else:
                     break
@@ -1452,7 +1473,7 @@ class ComputeManager(manager.Manager):
                     if csg_uuid:
                         self._update_change_since_time(csd_server)
                         self._heal_instance_state(context, csg_uuid, csd_server)
-
+            LOG.debug('end time of _heal_instances_state is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         except exception.InstanceNotFound as msg:
             LOG.error(_('Failed to sys server status to db. %s'), str(traceback.format_exc()))
         except Exception as msg:
@@ -1463,11 +1484,18 @@ class ComputeManager(manager.Manager):
         try:
             csg_instance = objects.Instance.get_by_uuid(
                 context, csg_uuid)
+            #add by liuling
+            if csg_instance.task_state  == task_states.MIGRATING:
+                return
             self._check_and_heal_instance_host(context, csg_instance, csd_server)
 
             self._check_and_heal_instance_fault(context, csg_instance, csd_server)
 
             if not self._need_to_update_instance_state(csg_instance, csd_server):
+                #add by liuling
+                LOG.debug('the instance %s not need to update state' %csg_uuid)
+                LOG.debug('the csg_instance %s info is %s' %(csg_uuid,str(csg_instance.__dict__)))
+                LOG.debug('the csd_server %s info is %s' %(csd_server.id,str(csd_server.__dict__)))
                 return
         except exception.InstanceNotFound:
             LOG.warn("Instance:%s is not found during confirmation" % csg_uuid)

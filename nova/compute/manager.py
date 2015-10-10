@@ -2531,6 +2531,7 @@ class ComputeManager(manager.Manager):
         # db again, as this means they are sent in the old format and we want
         # to avoid converting them back when we can just get them.
         # Remove this when we bump the RPC major version to 4.0
+        LOG.debug('Begin terminate instance %s '%instance.uuid)
         if (bdms and
             any(not isinstance(bdm, obj_base.NovaObject)
                 for bdm in bdms)):

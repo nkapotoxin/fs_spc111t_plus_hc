@@ -349,11 +349,11 @@ class APIRouterV21(base_wsgi.Router):
         missing_extensions = API_V3_CORE_EXTENSIONS - extensions_loaded
         return list(missing_extensions)
 
-    def _register_extension(self, ext):
-        raise NotImplementedError()
-
     @property
     def loaded_extension_info(self):
+        raise NotImplementedError()
+
+    def _register_extension(self, ext):
         raise NotImplementedError()
 
     def _register_resources(self, ext, mapper):

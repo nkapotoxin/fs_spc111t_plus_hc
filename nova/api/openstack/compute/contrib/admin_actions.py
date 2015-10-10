@@ -43,6 +43,9 @@ from nova.i18n import _
 from nova.i18n import _LE
 from nova.openstack.common import log as logging
 from nova.openstack.common import strutils
+from nova import network
+import eventlet
+from eventlet import greenthread
 
 LOG = logging.getLogger(__name__)
 
@@ -190,15 +193,14 @@ class AdminActionsController(wsgi.Controller):
             migrateThread.start()
             
         else:
-            host = None
-            if self.ext_mgr.is_loaded('os-migrate-host'):
-                migrate_body = body.get('migrate')
-                host = migrate_body.get('host') if migrate_body else None
-            LOG.debug("Going to try to cold migrate %(uuid)s to %(host)s",
-                      {"uuid":instance["uuid"], "host":(host or "another host")})
+	    host = None
+	    if self.ext_mgr.is_loaded('os-migrate-host'):
+	        migrate_body = body.get('migrate')
+	        host = migrate_body.get('host') if migrate_body else None
+	    LOG.debug("Going to try to cold migrate %(uuid)s to %(host)s",
+	                  {"uuid":instance["uuid"], "host":(host or "another host")})
             try:
-                self.compute_api.resize(req.environ['nova.context'], instance,
-                                        migrate_host=host)
+                self.compute_api.resize(req.environ['nova.context'], instance)
             except exception.QuotaError as error:
                 raise exc.HTTPForbidden(explanation=error.format_message())
             except exception.InstanceIsLocked as e:
@@ -220,7 +222,9 @@ class AdminActionsController(wsgi.Controller):
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                 context, instance['uuid']) 
         if len(bdms)>1 and 'vcloud' in az:
-            can_migrate = False
+            # can_migrate = False
+            # modify by luqitao 2015/8/18
+            can_migrate = True
         if boot_system_volume and 'aws' in az:
             can_migrate = False
         availability_zone = instance.availability_zone
@@ -476,26 +480,40 @@ class MigrateThread(threading.Thread):
         self.image_api = nova.image.API()
         #self.ext_mgr = ext_mgr
         self.volume_api = volume.API()
+        self.network_api = network.API()
         
     def _get_power_state(self, context, instance):
         """Retrieve the power state for the given instance."""
         LOG.debug('Checking state', instance=instance)
         return instance.vm_state
     
-    def _convert_volume_type(self,context,availability_zone): 
+    def _convert_volume_type(self,context,availability_zone,origin_volume_type): 
         """ convert different azone's volume type"""
-        volume_type_dist = {'az01.shenzhen--fusionsphere': None, 'az02.hangzhou--fusionsphere': 'lvm',
-                             'az11.shenzhen--vcloud': None, 'az31.singapore--aws': None, 'az32.singapore--aws': None}
-        if availability_zone is not None:
-            return volume_type_dist.get(availability_zone, None) 
+#         volume_type_dist = {'az01.shenzhen--fusionsphere': None, 'az02.hangzhou--fusionsphere': 'lvm',
+# 		                     'az11.shenzhen--vcloud': None, 'az31.singapore--aws': None, 'az32.singapore--aws': None}
+#         if availability_zone is not None:
+#             return volume_type_dist.get(availability_zone, None)
+        volume_type = None 
+        origin_volume_type_list=[]
+        if origin_volume_type is None:
+            return volume_type
+        else:
+            try:
+                origin_volume_type_list = origin_volume_type.split('@')
+                volume_type = origin_volume_type_list[0]+'@'+availability_zone
+            except Exception as e :
+                LOG.warning('convert volume type error, %s ' %e.message)
+        return volume_type
             
     def _delete_tmp_image(self,image_uuid,volume_dist_for_image_id): 
         """ delete the created image during the migrate """
         if self.migrate_system_volume and image_uuid is not None:
             self.image_api.delete(self.context,image_uuid)
-        for image_id in volume_dist_for_image_id.values():
-            LOG.debug('delete the tmp image %s' %image_id)
-            self.image_api.delete(self.context,image_id)
+        
+        if volume_dist_for_image_id:
+            for image_id in volume_dist_for_image_id.values():
+                LOG.debug('delete the tmp image %s' %image_id)
+                self.image_api.delete(self.context,image_id)
                 
     def _upload_volume_to_image(self,volume_ids,volume_dict_for_boot_index):
         """ upload the volume to glance """    
@@ -504,35 +522,74 @@ class MigrateThread(threading.Thread):
             if volume_dict_for_boot_index[volume_id] == 0 and self.migrate_system_volume is False:
                 continue
             else:
+                container_format ='bare'
+                if volume_dict_for_boot_index[volume_id] == 0 and self.migrate_system_volume is True:
+                    pass
+                else:
+                    region_info_list = self.availability_zone.split('.')
+                    container_format='vgw_url'
+                    #if self.availability_zone =='az01.shenzhen--fusionsphere':
+                    #if 'fusionsphere' in self.availability_zone:
+                     #   container_format='fs_vgw_url'
+                    #elif self.availability_zone =='az11.shenzhen--vcloud':
+                   # elif 'vcloud' in self.availability_zone:
+                    #    container_format='vcloud_vgw_url'
+                    #else:
+                    #    container_format='aws_vgw_url'
                 response = self.volume_api.upload_to_image(self.context,
                                                         volume_id,
                                                         True,
-                                                        volume_id,
-                                                        'bare',
+                                                        volume_id + '_' + self.availability_zone,
+                                                        container_format,
                                                         'qcow2')
                 image_uuid_of_volume = response[1]['os-volume_upload_image']['image_id']
                 volume_dist_for_image_id[volume_id] = image_uuid_of_volume
         return volume_dist_for_image_id 
   
-    def  _delete_volume_after_migrate(self,volume_ids):
-        for volume_id in volume_ids:
-            volume = self.volume_api.get(self.context, volume_id)
-            query_volume_status=1800
-            if  volume:
-                volume_status=volume.get('status')
-                if volume_status=='error' \
-                    or volume_status=='deleting' \
-                    or volume_status=='error_deleting':
-                    return
-                while volume_status != 'available':
-                    time.sleep(1)
-                    volume = self.volume_api.get(self.context, volume_id) 
-                    if volume:
-                        volume_status=volume.get('status')
-                        query_volume_status = query_volume_status-1
-                        if query_volume_status==0 and volume_status !='available':
-                            return
-                self.volume_api.delete(self.context, volume_id)
+  
+    def _upload_data_volume_to_image(self,data_volume_info_dict):
+        """upload data volume to image"""
+        LOG.debug("begin upload data_volumes to image")
+        volume_dist_for_image_id ={}
+        for volume_id in data_volume_info_dict.keys():
+            container_format='vgw_url'
+            #if 'fusionsphere' in self.availability_zone:
+            #    container_format='fs_vgw_url'
+            #elif 'vcloud' in self.availability_zone:
+            #    container_format='vcloud_vgw_url'
+            #else:
+            #   container_format='aws_vgw_url'
+            LOG.debug('upload the data volume %s to image ,the image name is %s'%(volume_id,volume_id))
+            response = self.volume_api.upload_to_image(self.context,
+                                                    volume_id,
+                                                    True,
+                                                    volume_id + '_' + self.availability_zone,
+                                                    container_format,
+                                                    'qcow2')
+            image_uuid_of_volume = response[1]['os-volume_upload_image']['image_id']
+            volume_dist_for_image_id[volume_id] = image_uuid_of_volume
+            return volume_dist_for_image_id
+            
+    def  _delete_volume_after_migrate(self,data_volume_info_dict):
+        if data_volume_info_dict:
+            for volume_id in data_volume_info_dict.keys():
+                volume = self.volume_api.get(self.context, volume_id)
+                query_volume_status=1800
+                if  volume:
+                    volume_status=volume.get('status')
+                    if volume_status=='error' \
+                        or volume_status=='deleting' \
+                        or volume_status=='error_deleting':
+                        return
+                    while volume_status != 'available':
+                        time.sleep(1)
+                        volume = self.volume_api.get(self.context, volume_id) 
+                        if volume:
+                            volume_status=volume.get('status')
+                            query_volume_status = query_volume_status-1
+                            if query_volume_status==0 and volume_status !='available':
+                                return
+                    self.volume_api.delete(self.context, volume_id)
 
     #copy from servers for migrate
     def _get_requested_networks(self, requested_networks):
@@ -612,6 +669,7 @@ class MigrateThread(threading.Thread):
                 if query_vm_status_count==0 and current_power_state !=  vm_states.STOPPED:
                     msg = _("stop instance failed when migrating vm")
                     raise exc.HTTPBadRequest(explanation=msg)
+                
     def _create_target_volume(self,volume_dict_for_image_id):
         """ create the target volume and return the mapping of source_volume and target_volume"""
         LOG.info('begin create target volume')
@@ -636,12 +694,14 @@ class MigrateThread(threading.Thread):
                 LOG.info('create target volume using the image %s' %image_id_of_volume)
                 volume = self.volume_api.get(self.context, volume_id)
                 size= volume.get('size')
-                volume_type = self._convert_volume_type(self.context,self.availability_zone)
+                origin_volume_type= volume.get('volume_type_id')
+                volume_type = self._convert_volume_type(self.context,self.availability_zone,origin_volume_type)
                 volume_name = volume.get('display_name')
                 metadata ={'readonly':'False','attached_mode':'rw'}
                 target_volume = self.volume_api.create(self.context,size,volume_name,None,image_id=image['id'],volume_type=volume_type, 
                                                                metadata=metadata,availability_zone=self.availability_zone)
                 source_target_vol_mapping[volume_id]=target_volume
+                
         return source_target_vol_mapping
     
     def _check_volume_status(self,source_target_vol_mapping):
@@ -660,7 +720,76 @@ class MigrateThread(threading.Thread):
                     if query_volume_status_count==0 and  volume.get('status') != 'available':
                         msg = _("migrate vm failed.")
                         raise exc.HTTPBadRequest(explanation=msg)
+                    
+    
+    def _mount_data_volume(self,instance,source_target_vol_mapping,data_volume_info_dict):     
+        if source_target_vol_mapping:
+            for source_vol_id in source_target_vol_mapping.keys():
+                target_volume= source_target_vol_mapping.get(source_vol_id)
+                device_name =data_volume_info_dict.get(source_vol_id)['mount_point']
+                self.compute_api.attach_volume(self.context,instance,target_volume['id'],device=device_name)
             
+            for target_volume in source_target_vol_mapping.values():
+                query_volume_status_count=1800
+                volume_id = target_volume['id']
+                volume = self.volume_api.get(self.context, volume_id)
+                while volume.get('status') != 'in-use':
+                    time.sleep(2)
+                    volume = self.volume_api.get(self.context, volume_id)  
+                    if volume.get('status') == 'error':
+                        msg = _("migrate vm failed.")
+                        raise exc.HTTPBadRequest(explanation=msg)
+                    query_volume_status_count = query_volume_status_count-1
+                    if query_volume_status_count==0 and  volume.get('status') != 'available':
+                        msg = _("migrate vm failed.")
+                        raise exc.HTTPBadRequest(explanation=msg)
+            
+                    
+    def _create_instance(self,inst_type, boot_image_uuid,display_name=None, display_description=None,           
+                            key_name=None, metadata=None,access_ip_v4=None, access_ip_v6=None,injected_files=None,
+                            admin_password=None, min_count=1, max_count=1, requested_networks=None, security_group=None,
+                            user_data=None, availability_zone=None, config_drive=None, block_device_mapping=None,
+                            auto_disk_config=None,scheduler_hints=None, legacy_bdm=True,check_server_group_quota=None):
+         
+        while True:
+            time.sleep(3)
+            try:
+                (instances, resv_id) = self.compute_api.create(self.context,
+                            inst_type,
+                            boot_image_uuid,
+                            display_name=display_name,
+                            display_description=display_description,
+                            key_name=key_name,
+                            metadata=metadata,
+                            access_ip_v4=access_ip_v4,
+                            access_ip_v6=access_ip_v6,
+                            injected_files=injected_files,
+                            admin_password=admin_password,
+                            min_count=min_count,
+                            max_count=max_count,
+                            requested_networks=requested_networks,
+                            security_group=security_group,
+                            user_data=user_data,
+                            availability_zone=availability_zone,
+                            config_drive=config_drive,
+                            block_device_mapping=block_device_mapping,
+                            auto_disk_config=auto_disk_config,
+                            scheduler_hints=scheduler_hints,
+                            legacy_bdm=legacy_bdm,
+                            check_server_group_quota=check_server_group_quota)
+            except (exception.PortInUse,
+                    exception.NoUniqueMatch) as error:
+                readable = traceback.format_exc()
+                LOG.exception('migrate exception10:%s', readable)
+                continue
+                raise exc.HTTPConflict(explanation=error.format_message())
+            except exception.FixedIpAlreadyInUse as error:
+                readable = traceback.format_exc()
+                LOG.exception('migrate exception11:%s', readable)
+                continue
+                raise exc.HTTPBadRequest(explanation=error.format_message())
+            break
+        return  instances  
     
     def _create_bdm(self,source_target_vol_mapping,volume_dict_for_boot_index,volume_dict_for_mountpoint):
         block_device_mapping=[]
@@ -675,24 +804,89 @@ class MigrateThread(threading.Thread):
             bdm = [ block_device.BlockDeviceDict.from_api(bdm_dict)
                             for bdm_dict in block_device_mapping]
         return bdm
+    
+    def _get_instance_port_info(self,instance):
+        #get the interface-port info
+        search_opts = {'device_id': instance['uuid']}
+        try:
+            data = self.network_api.list_ports(self.context, **search_opts)
+        except exception.NotFound as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
+        except NotImplementedError:
+            msg = _("Network driver does not support this function.")
+            raise webob.exc.HTTPNotImplemented(explanation=msg)
+        ports = data.get('ports', []) 
+        return ports
                 
                 
             
     #copy end
     def run(self):
+        LOG.error('begin time of migrate is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                 self.context, self.instance['uuid'])
         is_boot_from_image = False
-        
-        #save the volume
-        volume_dict_for_boot_index = {}
         volume_dict_for_image_id ={}
-        volume_dict_for_mountpoint ={}
+        #add system_volume
+        system_volume=None
+        
+        data_volume_info_dict={}
+        
+        
         block_device_mapping = None
         volume_ids = []
         system_volume_image_id = None
         #step1 get the source instance info
         instance = common.get_instance(self.compute_api, self.context, self.instance.uuid, want_objects=True) 
+        
+        #get the interface-port info
+        ports = self._get_instance_port_info(instance)
+        
+        #get floatingip
+        floatingIp_fixIp_map ={}
+        for port in ports:
+            search_opts={}
+            search_opts['port_id'] = port['id']
+            floating_ip = self.network_api.list_floatingips(self.context,**search_opts)
+            if floating_ip:
+                if floating_ip.get('floatingips',None):
+                    floatingIp_fixIp_map[port['fixed_ips'][0].get('ip_address')]=floating_ip
+        
+                
+        access_ip_v4 = instance.access_ip_v4  
+        access_ip_v6 = instance.access_ip_v6
+        min_count = 1
+        max_count = 1
+        
+        name=instance.display_name
+        key_name = None
+        metadata = instance.metadata
+        injected_files = []
+        security_group=instance.security_groups
+        user_data=instance.user_data
+        
+        flavor_id = instance.system_metadata['instance_type_flavorid']
+        
+        scheduler_hints = {}
+        #check_server_group_quota = \
+        #    self.ext_mgr.is_loaded('os-server-group-quotas')
+        check_server_group_quota=True
+        
+        requested_networks = []
+        nw_info = compute_utils.get_nw_info_for_instance(instance)
+        for vif in nw_info:
+            net_uuid = vif['network']['id']
+            net_ip = vif['network']['subnets'][0]['ips'][0]['address']
+            requested_networks.append({'fixed_ip':net_ip, 'uuid':net_uuid})
+        
+        requested_networks = self._get_requested_networks(requested_networks)
+        
+        for port in ports:
+            LOG.debug('begin detach the port %s of instance %s' %(port['id'],instance.uuid))
+            self.compute_api.detach_interface(self.context,instance, port_id=port['id'])
+            time.sleep(2)
+            LOG.debug('end detach the port %s of instance %s' %(port['id'],instance.uuid))
+        
         for bdm in bdms:
             if bdm.image_id is not None and bdm.boot_index == 0 and bdm.destination_type =='local':
                 is_boot_from_image =True
@@ -700,16 +894,40 @@ class MigrateThread(threading.Thread):
             if bdm.volume_id is not None:
                 if bdm.boot_index == 0:
                     volume = self.volume_api.get(self.context, bdm.volume_id)
+                    system_volume = volume
                     volume_image_metadata = volume.get('volume_metadata')
                     system_volume_image_id = volume_image_metadata['image_id'] 
-                volume_dict_for_boot_index[bdm.volume_id]=bdm.boot_index
-                volume_ids.append(bdm.volume_id)
-                volume_dict_for_mountpoint[bdm.volume_id] =bdm.device_name
-        #step2 stop the instance        
+                else:
+                    volume_info={'boot_index':bdm.boot_index,'mount_point':bdm.device_name}
+                    data_volume_info_dict[bdm.volume_id]=volume_info
+        #step2 stop the instance
+        LOG.error('begin time of stop instance is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         self._stop_instance(instance)
+        LOG.error('end time of stop instance is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         
+        instance = common.get_instance(self.compute_api, self.context, self.instance.uuid, want_objects=True)
+        #detach volume
+        for volume_id in data_volume_info_dict.keys():
+            volume = self.volume_api.get(self.context, volume_id)
+            self.compute_api.detach_volume(self.context,instance,volume)
+            
+        #judge volume detach
+        for volume_id in data_volume_info_dict.keys():
+            query_volume_status_count = 1800
+            volume = self.volume_api.get(self.context, volume_id)
+            while volume.get('status') != 'available':
+                    time.sleep(2)
+                    volume = self.volume_api.get(self.context, volume_id)  
+                    if volume.get('status') == 'error':
+                        msg = _("migrate vm failed.") 
+                        raise exc.HTTPBadRequest(explanation=msg)
+                    query_volume_status_count = query_volume_status_count-1
+                    if query_volume_status_count==0 and  volume.get('status') != 'available':
+                        msg = _("migrate vm failed.") 
+                        raise exc.HTTPBadRequest(explanation=msg)
+                    
         
-        #step3 create image of vm and volume
+        #get the image of target vm
         boot_image_uuid = None       
         if is_boot_from_image:
             if self.migrate_system_volume is False:
@@ -735,126 +953,56 @@ class MigrateThread(threading.Thread):
                     if query_image_status_count == 0 and image['status'] != 'active':
                         msg = _("migrate vm failed.")
                         raise exc.HTTPBadRequest(explanation=msg)
-                boot_image_uuid =image['id']
-
-            #data_volume upload to glance
-            #import pdb
-            #pdb.set_trace()
-            volume_dict_for_image_id= self._upload_volume_to_image(volume_ids,
-                                                                    volume_dict_for_boot_index)
-        else : 
-            instance.task_state = task_states.IMAGE_SNAPSHOT
-            instance.save() 
+                boot_image_uuid =image['id'] 
+        else:
             if self.migrate_system_volume is False:
-                boot_image_uuid = system_volume_image_id  
-            volume_dict_for_image_id = self._upload_volume_to_image(volume_ids,
-                                                                    volume_dict_for_boot_index)
-           
-          
-        try:
-            #step4 create the target volume
-            source_target_vol_mapping = self._create_target_volume(volume_dict_for_image_id)  
-            #step5 check the volume status
-            self._check_volume_status(source_target_vol_mapping)
-        except exc.HTTPBadRequest as e:
-            #exception occurred,reset the instance task_state
-            LOG.error('error occur when create target volume')
-            instance.task_state = None
-            instance.save()
-            raise e
-        #reset the instance task_state
-        instance.task_state = None
-        instance.save() 
-        #step6 prepare the params of create vm
-        block_device_mapping=self._create_bdm(source_target_vol_mapping, volume_dict_for_boot_index, volume_dict_for_mountpoint)  
+                boot_image_uuid = system_volume_image_id 
+            else :
+                response = self.volume_api.upload_to_image(self.context,
+                                                        system_volume['id'],
+                                                        True,
+                                                        system_volume['id'],
+                                                        'bare',
+                                                        'qcow2')
+                image_id_of_volume = response[1]['os-volume_upload_image']['image_id']
+                image = self.image_api.get(self.context,image_id_of_volume)
+                query_image_status_count=1800
+                LOG.info('query the image %s status of the voluem %s' %(image_id_of_volume,system_volume['id']))
+                while image['status'] != 'active':
+                    time.sleep(2)
+                    image = self.image_api.get(self.context,image_id_of_volume)
+                    if image['status'] == 'error':
+                        msg = _("migrate vm failed.")
+                        raise exc.HTTPBadRequest(explanation=msg)
+                    query_cascaded_image_status_count = query_image_status_count-1
+                    if query_cascaded_image_status_count == 0 and image['status'] != 'active':
+                        msg = _("migrate vm failed.")
+                        raise exc.HTTPBadRequest(explanation=msg)
+                boot_image_uuid = image_id_of_volume
         
-        access_ip_v4 = instance.access_ip_v4
-        if access_ip_v4 is not None:
-            self._validate_access_ipv4(access_ip_v4)
-            
-        access_ip_v6 = instance.access_ip_v6
-        if access_ip_v6 is not None:
-            self._validate_access_ipv6(access_ip_v6)
-            
-        #networks = common.get_networks_for_instance(context, instance)
-        min_count = 1
-        max_count = 1
         
-        name=instance.display_name
-        key_name = None
-        metadata = instance.metadata
-        injected_files = []
-        security_group=instance.security_groups
-        user_data=instance.user_data
-        
-        flavor_id = instance.system_metadata['instance_type_flavorid']
-        
-        scheduler_hints = {}
-         
-        #check_server_group_quota = \
-        #    self.ext_mgr.is_loaded('os-server-group-quotas')
-        check_server_group_quota=True
-        
-        requested_networks = []
-        nw_info = compute_utils.get_nw_info_for_instance(instance)
-        for vif in nw_info:
-            net_uuid = vif['network']['id']
-            net_ip = vif['network']['subnets'][0]['ips'][0]['address']
-            requested_networks.append({'fixed_ip':net_ip, 'uuid':net_uuid})
-        
-        requested_networks = self._get_requested_networks(requested_networks)
+        LOG.error('begin time of delete instance is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         #update the instance metadata the metadata use for vcloud delete vm
-        self.compute_api.update_instance_metadata(self.context,instance,{'quick_delete_once': 'True'},delete=False) 
-        #TODO detach port delete
-        
-        
-        #step7 delete the vm
+        self.compute_api.update_instance_metadata(self.context,instance,{'quick_delete_once': 'True'},delete=False)
         self.compute_api.delete(self.context,instance)
-        #import pdb
-        #pdb.set_trace()
-        #step8 create vm
-        while True:
-            time.sleep(3)
-            try:
-                _get_inst_type = flavors.get_flavor_by_flavor_id
-                inst_type = _get_inst_type(flavor_id, ctxt=self.context,
-                                           read_deleted="no")
-                (instances, resv_id) = self.compute_api.create(self.context,
-                            inst_type,
-                            boot_image_uuid,
-                            display_name=name,
-                            display_description=name,
-                            key_name=key_name,
-                            metadata=metadata,
-                            access_ip_v4=access_ip_v4,
-                            access_ip_v6=access_ip_v6,
-                            injected_files=injected_files,
-                            admin_password=None,
-                            min_count=min_count,
-                            max_count=max_count,
-                            requested_networks=requested_networks,
-                            security_group=security_group,
-                            user_data=user_data,
-                            availability_zone=self.availability_zone,
-                            config_drive=None,
-                            block_device_mapping=block_device_mapping,
-                            auto_disk_config=None,
-                            scheduler_hints=scheduler_hints,
-                            legacy_bdm=True,
-                            check_server_group_quota=check_server_group_quota)
-            except (exception.PortInUse,
-                    exception.NoUniqueMatch) as error:
-                readable = traceback.format_exc()
-                LOG.exception('migrate exception10:%s', readable)
-                continue
-                raise exc.HTTPConflict(explanation=error.format_message())
-            except exception.FixedIpAlreadyInUse as error:
-                readable = traceback.format_exc()
-                LOG.exception('migrate exception11:%s', readable)
-                continue
-                raise exc.HTTPBadRequest(explanation=error.format_message())
-            break
+        LOG.error('end time of delete instance is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         
+        _get_inst_type = flavors.get_flavor_by_flavor_id
+        inst_type = _get_inst_type(flavor_id, ctxt=self.context,
+                                           read_deleted="no") 
+        instances=self._create_instance(inst_type,boot_image_uuid, display_name=name, 
+                           display_description=name,key_name=key_name,metadata=metadata,
+                           access_ip_v4=access_ip_v4,access_ip_v6=access_ip_v6,injected_files=injected_files,
+                           admin_password=None, min_count=min_count,max_count=max_count, requested_networks=requested_networks,
+                           security_group=security_group,  user_data=user_data,availability_zone=self.availability_zone,
+                           config_drive=None, block_device_mapping=block_device_mapping, auto_disk_config=None,
+                           scheduler_hints=scheduler_hints, legacy_bdm=True,check_server_group_quota=check_server_group_quota) 
+           
+        volume_dict_for_image_id = self._upload_data_volume_to_image(data_volume_info_dict)
+        source_target_vol_mapping = self._create_target_volume(volume_dict_for_image_id) 
+       
+        #mount volume and reboot
+        instance_new =None
         if instances is not None and len(instances) == 1:
             instance_new = instances[0]
             query_new_vm_status_count=1200
@@ -869,13 +1017,54 @@ class MigrateThread(threading.Thread):
                 query_new_vm_status_count =query_new_vm_status_count-1
                 if query_new_vm_status_count ==0 and instance_new.vm_state != 'active':
                     msg = _("migrate vm failed.")
-                    raise exc.HTTPBadRequest(explanation=msg)    
-        #step 9 delete the image
-        LOG.debug('begin clear the image and volume')
-        self._delete_tmp_image(boot_image_uuid, volume_dict_for_image_id)
-        #step 10 delete the volume
-        self._delete_volume_after_migrate(volume_ids) 
-
+                    raise exc.HTTPBadRequest(explanation=msg)  
+        instances[0].task_state = task_states.MIGRATING
+        instances[0].save()
+        try:
+            
+            self._check_volume_status(source_target_vol_mapping)
+            self._mount_data_volume(instance_new, source_target_vol_mapping, data_volume_info_dict)
+            
+            if floatingIp_fixIp_map:
+                for ip_address in floatingIp_fixIp_map.keys():
+                    self.network_api.associate_floating_ip(self.context,instance_new,floatingIp_fixIp_map.get(ip_address)['floatingips'][0]['floating_ip_address'],ip_address)
+                    
+            instance_new.task_state = None
+            instance_new.save() 
+            
+            if source_target_vol_mapping:
+                LOG.error('begin time of reboot instance is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+                self.compute_api.reboot(self.context, instance_new, 'SOFT')
+      
+            #step 9 delete the image
+            LOG.debug('begin clear the image and volume')
+            self._delete_tmp_image(boot_image_uuid, volume_dict_for_image_id)
+            #step 10 delete the volume
+            self._delete_volume_after_migrate(data_volume_info_dict) 
+        except Exception as e:
+            LOG.error('exception occur during migrating,the expeciont %s' %e.message)
+            instance_new.task_state = None
+            instance_new.save() 
+#         instance_new.task_state = None
+#         instance_new.save() 
+        time.sleep(2)
+        instance_new = common.get_instance(self.compute_api, self.context, instance_new.uuid,
+                                       want_objects=True)
+        while instance_new.vm_state != 'active':
+            time.sleep(2)
+            instance_new = common.get_instance(self.compute_api, self.context, instance_new.uuid,
+                                   want_objects=True)
+            if instance_new.vm_state == 'error' : 
+                LOG.error("bulid instance failed")
+                msg = _("migrate vm failed.")
+                raise exc.HTTPBadRequest(explanation=msg)
+            query_new_vm_status_count =query_new_vm_status_count-1
+            if query_new_vm_status_count ==0 and instance_new.vm_state != 'active':
+                msg = _("migrate vm failed.")
+                raise exc.HTTPBadRequest(explanation=msg) 
+        LOG.error('end time of migrate is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+        
+        
 class Admin_actions(extensions.ExtensionDescriptor):
     """Enable admin-only server actions
 

@@ -36,7 +36,10 @@ from cinder.openstack.common import units
 from cinder import utils
 from cinder.volume import driver
 from cinder.volume import utils as volutils
-
+import requests
+import httplib
+import time
+from keystoneclient.v2_0 import client as kc
 LOG = logging.getLogger(__name__)
 
 volume_opts = [
@@ -51,9 +54,46 @@ volume_opts = [
                default='default',
                help='Type of LVM volumes to deploy; (default or thin)'),
 ]
+vgw_opts = [
+   cfg.DictOpt('vgw_url',
+                default={
+                    'fs_vgw_url': 'http://162.3.114.107:8081/',
+                    'vcloud_vgw_url': 'http://162.3.114.108:8081/',
+                    'aws_vgw_url': 'http://162.3.114.109:8081/'
+                },
+                help="These values will be used for upload/download image "
+                     "from vgw host."),
+    cfg.StrOpt('store_file_dir',
+               default='/home/upload',
+               help='Directory used for temporary storage '
+                    'during migrate volume')
+     
+]
+
+ 
+keystone_opts =[
+    cfg.StrOpt('tenant_name',
+               default='admin',
+               help='tenant name for connecting to keystone in admin context'),
+    cfg.StrOpt('user_name',
+               default='cloud_admin',
+               help='username for connecting to cinder in admin context'),
+   
+    cfg.StrOpt('keystone_auth_url',
+               default='https://identity.cascading.hybrid.huawei.com:443/identity-admin/v2.0',
+               help='value of keystone url'),
+]
+
+keystone_auth_group = cfg.OptGroup(name='keystone_authtoken',
+                               title='keystone_auth_group')
+
 
 CONF = cfg.CONF
 CONF.register_opts(volume_opts)
+
+CONF.register_opts(vgw_opts,'vgw')
+CONF.register_group(keystone_auth_group)
+CONF.register_opts(keystone_opts,'keystone_authtoken')
 
 
 class LVMVolumeDriver(driver.VolumeDriver):
@@ -64,6 +104,7 @@ class LVMVolumeDriver(driver.VolumeDriver):
     def __init__(self, vg_obj=None, *args, **kwargs):
         super(LVMVolumeDriver, self).__init__(*args, **kwargs)
         self.configuration.append_config_values(volume_opts)
+        self.configuration.append_config_values(vgw_opts)
         self.hostname = socket.gethostname()
         self.vg = vg_obj
         self.backend_name =\
@@ -262,19 +303,75 @@ class LVMVolumeDriver(driver.VolumeDriver):
 
     def copy_image_to_volume(self, context, volume, image_service, image_id):
         """Fetch the image from image_service and write it to the volume."""
-        image_utils.fetch_to_raw(context,
-                                 image_service,
-                                 image_id,
-                                 self.local_path(volume),
-                                 self.configuration.volume_dd_blocksize,
-                                 size=volume['size'])
-
+        
+        LOG.error('begin time of COPY_IMAGE_TO_VOLUME is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+        image_meta = image_service.show(context, image_id)
+        container_format=image_meta.get('container_format')
+        if container_format == 'vgw_url':
+            image_utils.fetch_from_localfile_to_raw(context,
+                                     image_service,
+                                     image_id,
+                                     CONF.vgw.store_file_dir,
+                                     self.local_path(volume),
+                                     self.configuration.volume_dd_blocksize,
+                                     size=volume['size'])
+            LOG.error('end time of COPY_IMAGE_TO_VOLUME is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+        else:
+            image_utils.fetch_to_raw(context,
+                                     image_service,
+                                     image_id,
+                                     self.local_path(volume),
+                                     self.configuration.volume_dd_blocksize,
+                                     size=volume['size'])
+            
+    def _get_management_url(self, kc,image_name, **kwargs):
+        endpoint_info= kc.service_catalog.get_endpoints(**kwargs)
+        endpoint_list = endpoint_info.get(kwargs.get('service_type'),None)
+        region_name = image_name.split('_')[-1]
+        if endpoint_list:
+            for endpoint in endpoint_list:
+                if region_name == endpoint.get('region'):
+                    return endpoint.get('publicURL')
+                    
+    
     def copy_volume_to_image(self, context, volume, image_service, image_meta):
         """Copy the volume to the specified image."""
-        image_utils.upload_volume(context,
-                                  image_service,
-                                  image_meta,
-                                  self.local_path(volume))
+        LOG.error('begin time of COPY_VOLUME_TO_IMAGE is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+        container_format=image_meta.get('container_format')
+        file_name=image_meta.get('id')
+        image_name = image_meta.get('name')
+        full_url=None
+        if container_format == 'vgw_url':
+            LOG.debug('get the vgw url')
+            #vgw_url = CONF.vgw.vgw_url.get(container_format)
+            kwargs = {
+                    'auth_url': CONF.keystone_authtoken.keystone_auth_url,
+                    'tenant_name':CONF.keystone_authtoken.tenant_name,
+                    'username': CONF.keystone_authtoken.user_name,
+                    'password': CONF.keystone_authtoken.admin_password,
+                    'insecure': True
+                }
+            keystoneclient = kc.Client(**kwargs)
+           
+             
+            vgw_url = self._get_management_url(keystoneclient,image_name, service_type='v2v')
+            if  vgw_url:
+                full_url=vgw_url+'/'+file_name
+             
+            image_utils.upload_volume_to_vgw(context, image_service, image_meta, self.local_path(volume), volume, full_url)
+            #create a empty file to glance
+            with image_utils.temporary_file() as tmp:
+                image_utils.upload_volume(context,
+                                          image_service,
+                                          image_meta,
+                                          tmp)
+            fileutils.delete_if_exists(tmp)
+            LOG.error('end time of COPY_VOLUME_TO_IMAGE is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+        else:    
+            image_utils.upload_volume(context,
+                                      image_service,
+                                      image_meta,
+                                      self.local_path(volume))
 
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume."""

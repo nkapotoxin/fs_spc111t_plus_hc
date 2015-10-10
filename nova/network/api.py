@@ -310,6 +310,11 @@ class API(base_api.NetworkAPI):
     # NOTE(danms): Here for neutron compatibility
     def list_ports(self, *args, **kwargs):
         raise NotImplementedError()
+    
+    # NOTE(danms): Here for neutron compatibility
+    def list_floatingips(self, *args, **kwargs):
+        raise NotImplementedError()
+
 
     # NOTE(danms): Here for neutron compatibility
     def show_port(self, *args, **kwargs):

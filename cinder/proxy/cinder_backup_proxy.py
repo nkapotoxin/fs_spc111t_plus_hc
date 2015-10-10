@@ -209,7 +209,7 @@ class CinderBackupProxy(manager.SchedulerDependentManager):
         try:
             kwargs = {'username': cfg.CONF.cinder_username,
                       'password': cfg.CONF.admin_password,
-                      'tenant_id': cfg.CONF.cinder_tenant_id,
+                      'tenant_name': CONF.cinder_tenant_name,
                       'auth_url': cfg.CONF.keystone_auth_url,
                       'insecure': True
                       }
@@ -259,10 +259,12 @@ class CinderBackupProxy(manager.SchedulerDependentManager):
                 backup_info = {'status':backup['status'],
                                'id':backup['id']}
                 self.backup_cache.append(backup_info)
-                
-            if backup['status'] == 'deleting':
+
+            # TODO: this won't work because under this context, you have
+            # no project id
+            '''if backup['status'] == 'deleting':
                 LOG.info(_('Resuming delete on backup: %s.') % backup['id'])
-                self.delete_backup(ctxt, backup['id'])
+                self.delete_backup(ctxt, backup['id'])'''
 
         self.init_flag = True
 
@@ -270,17 +272,27 @@ class CinderBackupProxy(manager.SchedulerDependentManager):
         """Create volume backups using configured backup service."""
         backup = self.db.backup_get(context, backup_id)
         volume_id = backup['volume_id']
-        metadata = ""
+
         display_description = backup['display_description']
         container = backup['container']
-        volume = self.db.volume_get(context, volume_id)
         display_name = self._gen_ccding_backup_name(backup_id)
-        availability_zone = cfg.CONF.cascaded_available_zone
+        availability_zone = cfg.CONF.storage_availability_zone
+
+        # Because volume could be available or in-use
+        initial_vol_status = self.db.volume_get(context, volume_id)['status']
+        self.db.volume_update(context, volume_id, {'status': 'backing-up'})
+
+        '''if volume status is in-use, it must have been checked with force flag
+            in cascading api layer'''
+        force = False
+        if initial_vol_status == 'in-use':
+            force = True
+
         LOG.info(_('cascade info: Create backup started, backup: %(backup_id)s '
                    'volume: %(volume_id)s.') %
                  {'backup_id': backup_id, 'volume_id': volume_id})
 
-
+        volume = self.db.volume_get(context, volume_id)
         expected_status = 'backing-up'
         actual_status = volume['status']
         if actual_status != expected_status:
@@ -301,7 +313,7 @@ class CinderBackupProxy(manager.SchedulerDependentManager):
                 'expected_status': expected_status,
                 'actual_status': actual_status,
             }
-            self.db.volume_update(context, volume_id, {'status': 'available'})
+            self.db.volume_update(context, volume_id, {'status': initial_vol_status})
             self.db.backup_update(context, backup_id, {'status': 'error',
                                                        'fail_reason': err})
             raise exception.InvalidBackup(reason=err)
@@ -331,40 +343,47 @@ class CinderBackupProxy(manager.SchedulerDependentManager):
                 volume_id=cascaded_volume_id,
                 container=container,
                 name=display_name,
-                description=display_description)
+                description=display_description,
+                force=force)
             LOG.info(_("cascade ino: create backup while response is:%s"),
                      bodyResponse._info)
             self.volumes_mapping_cache['backups'][backup_id] = \
                 bodyResponse._info['id']
-            self.db.backup_update(context, backup['id'],
-                                            {'service_metadata': metadata})
+
+            # use service metadata to record cascading to cascaded backup id
+            # mapping, to support cross az backup restore
+            metadata = "mapping_uuid:" + bodyResponse._info['id'] + ";"
+            tmp_metadata = None
             while True:
                 time.sleep(CONF.volume_sync_interval)
                 queryResponse = \
                     cinderClient.backups.get(bodyResponse._info['id'])
                 query_status = queryResponse._info['status']
                 if query_status != 'creating':
-                    metadata = queryResponse._info.get('service_metadata','')
+                    tmp_metadata = queryResponse._info.get('service_metadata','')
                     self.db.backup_update(context, backup['id'],
                                             {'status': query_status})
-                    self.db.volume_update(context, volume_id, {'status': 'available'})
+                    self.db.volume_update(context, volume_id, {'status': initial_vol_status})
                     break
                 else:
                     continue
         except Exception as err:
             with excutils.save_and_reraise_exception():
                 self.db.volume_update(context, volume_id,
-                                      {'status': 'available'})
+                                      {'status': initial_vol_status})
                 self.db.backup_update(context, backup['id'],
                                       {'status': 'error',
                                        'fail_reason': unicode(err)})
                 return
 
+        if tmp_metadata:
+            metadata = metadata + tmp_metadata
         self.db.backup_update(context, backup_id, {'status': query_status,
                                                    'size': volume['size'],
                                                    'availability_zone': availability_zone,
                                                     'service_metadata': metadata})
         LOG.info(_('Create backup finished. backup: %s.'), backup_id)
+
     def _get_cascaded_backup_id(self, backup_id):
 
         count = 0
@@ -388,13 +407,20 @@ class CinderBackupProxy(manager.SchedulerDependentManager):
             raise exception.InvalidBackup(reason=err)
         return cascaded_backup_id
 
-    def _get_cascaded_snapshot_id(self,context, snapshot_id):
+    def _get_cascaded_snapshot_id(self, context, snapshot_id):
         metadata = self.db.snapshot_metadata_get(context, snapshot_id)
         cascaded_snapshot_id = metadata['mapping_uuid']
         if cascaded_snapshot_id:
             LOG.info(_("cascade ino: cascaded_snapshot_id is:%s"),
                      cascaded_snapshot_id)
         return cascaded_snapshot_id
+
+    def _clean_up_fake_resource(self, cinderClient,
+                                fake_backup_id,
+                                fake_source_volume_id):
+        cinderClient.backups.delete(fake_backup_id)
+        cinderClient.volumes.delete(fake_source_volume_id)
+
     def restore_backup(self, context, backup_id, volume_id):
         """Restore volume backups from configured backup service."""
         LOG.info(_('Restore backup started, backup: %(backup_id)s '
@@ -403,7 +429,7 @@ class CinderBackupProxy(manager.SchedulerDependentManager):
 
         backup = self.db.backup_get(context, backup_id)
         volume = self.db.volume_get(context, volume_id)
-
+        availability_zone = cfg.CONF.storage_availability_zone
 
         expected_status = 'restoring-backup'
         actual_status = volume['status']
@@ -436,28 +462,118 @@ class CinderBackupProxy(manager.SchedulerDependentManager):
                       'backup_id': backup['id'],
                       'backup_size': backup['size']})
         try:
-
             cinderClient = self._get_cascaded_cinder_client(context)
-            cascaded_volume_id = self._query_cascaded_vol_id(context,volume_id)
-            cascaded_backup_id = \
-                    self.volumes_mapping_cache['backups'].get(backup_id,
-                                                                None)
-            bodyResponse = cinderClient.restores.restore(
-                backup_id=cascaded_backup_id,
-                volume_id=cascaded_volume_id)
-            LOG.info(_("cascade ino: restore backup  while response is:%s"),
-                     bodyResponse._info)
-            while True:
-                time.sleep(CONF.volume_sync_interval)
-                queryResponse = \
-                    cinderClient.backups.get(bodyResponse._info['backup_id'])
-                query_status = queryResponse._info['status']
-                if query_status != 'restoring':
-                    self.db.volume_update(context, volume_id, {'status': 'available'})
-                    self.db.backup_update(context, backup_id, {'status': query_status})
-                    break
-                else:
-                    continue
+            cascaded_volume_id = self._query_cascaded_vol_id(context, volume_id)
+
+            # the backup to be restored may be cross-az, so get cascaded backup id
+            # not from cache (since cache is built from cinder client of its own
+            # region), but retrieve it from service meta data
+            LOG.info(_("backup az:(backup_az)%s, conf az:%(conf_az)s") %
+                     {'backup_az': backup['availability_zone'],
+                      'conf_az': availability_zone})
+            fake_description = ""
+            fake_source_volume_id = None
+            fake_backup_id = None
+
+            cascaded_backup_id = None
+            # retrieve cascaded backup id
+            md_set = backup['service_metadata'].split(';')
+            if len(md_set) > 1 and 'mapping_uuid' in md_set[0]:
+                mapping_set = md_set[0].split(':')
+                cascaded_backup_id = mapping_set[1]
+
+            if backup['availability_zone'] != availability_zone:
+                cascading_volume_type = self.db.volume_type_get(
+                    context, volume['volume_type_id'])
+                cascading_volume_type_name = cascading_volume_type['name']
+                names = cascading_volume_type_name.split('@')
+                cascaded_volume_type_name = names[0] + '@' + availability_zone
+                LOG.info(_("cascaded vol type:%(cascaded_volume_type_name)s") %
+                         {'cascaded_volume_type_name': cascaded_volume_type_name})
+                volumeResponse = cinderClient.volumes.create(
+                    volume['size'],
+                    name=volume['display_name'] + "-fake",
+                    description=volume['display_description'],
+                    user_id=context.user_id,
+                    project_id=context.project_id,
+                    availability_zone=availability_zone,
+                    volume_type=cascaded_volume_type_name,
+                    metadata={'cross_az': "yes"})
+                fake_source_volume_id = volumeResponse._info['id']
+                time.sleep(30)
+
+                # save original backup id
+                cascaded_source_backup_id = cascaded_backup_id
+                # retrieve the original cascaded_source_volume_id
+                cascading_source_volume_id = backup['volume_id']
+                cascaded_source_volume_id = self._query_cascaded_vol_id(
+                    context, cascading_source_volume_id)
+
+                LOG.info(_("cascaded_source_backup_id:%(cascaded_source_backup_id)s,"
+                           "cascaded_source_volume_id:%(cascaded_source_volume_id)s" %
+                           {'cascaded_source_backup_id': cascaded_source_backup_id,
+                            'cascaded_source_volume_id': cascaded_source_volume_id}))
+                # compose display description for cascaded volume driver mapping to
+                # original source backup id and original source volume_id
+                fake_description = "cross_az:" + cascaded_source_backup_id + ":" + \
+                                      cascaded_source_volume_id
+                backup_bodyResponse = cinderClient.backups.create(
+                    volume_id=fake_source_volume_id,
+                    container=backup['container'],
+                    name=backup['display_name'] + "-fake",
+                    description=fake_description)
+
+                # set cascaded_backup_id as the faked one, which will help call
+                # into our volume driver's restore function
+                fake_backup_id = backup_bodyResponse._info['id']
+                cascaded_backup_id = backup_bodyResponse._info['id']
+                LOG.info(_("update cacaded_backup_id to created one:%s"),
+                         cascaded_backup_id)
+
+                LOG.info(_("restore, cascaded_backup_id:%(cascaded_backup_id)s, "
+                       "cascaded_volume_id:%(cascaded_volume_id)s, "
+                       "description:%(description)s") %
+                     {'cascaded_backup_id': cascaded_backup_id,
+                     'cascaded_volume_id': cascaded_volume_id,
+                     'description': fake_description})
+
+                bodyResponse = cinderClient.restores.restore(
+                    backup_id=cascaded_backup_id,
+                    volume_id=cascaded_volume_id)
+                LOG.info(_("cascade info: restore backup  while response is:%s"),
+                        bodyResponse._info)
+                while True:
+                    time.sleep(CONF.volume_sync_interval)
+                    queryResponse = \
+                        cinderClient.backups.get(cascaded_backup_id)
+                    query_status = queryResponse._info['status']
+                    if query_status != 'restoring':
+                        self.db.volume_update(context, volume_id, {'status': 'available'})
+                        self.db.backup_update(context, backup_id, {'status': query_status})
+                        LOG.info(_("get backup:%(backup)s status:%(status)s" %
+                               {'backup': cascaded_backup_id,
+                                'status': query_status}))
+                        if fake_backup_id and fake_source_volume_id:
+                            LOG.info(_("cleanup fake backup:%(backup)s,"
+                                   "fake source volume id:%(volume)s") %
+                                 {'backup': fake_backup_id,
+                                  'volume': fake_source_volume_id})
+                            cinderClient.backups.delete(fake_backup_id)
+                            cinderClient.volumes.delete(fake_source_volume_id)
+
+                        # TODO: note, this is a walkaround since target cced volume will be
+                        # TODO: changed with its logicalVolumeId to source ccing volume id
+                        # TODO: and thus may fail to flush status to correct ccing volume
+                        time.sleep(CONF.volume_sync_interval)
+                        self.db.volume_update(context, volume_id, {'status': 'available'})
+                        self.db.backup_update(context, backup_id, {'status': query_status})
+                        break
+                    else:
+                        continue
+            else:
+                 bodyResponse = cinderClient.restores.restore(
+                    backup_id=cascaded_backup_id,
+                    volume_id=cascaded_volume_id)
         except Exception:
             with excutils.save_and_reraise_exception():
                 self.db.volume_update(context, volume_id,
@@ -475,7 +591,6 @@ class CinderBackupProxy(manager.SchedulerDependentManager):
                             for item in volume['volume_metadata'])
         mapping_uuid = volume_metadata.get('mapping_uuid', None)
         return mapping_uuid
-
 
     def _delete_backup_cascaded(self, context, backup_id):
         try:

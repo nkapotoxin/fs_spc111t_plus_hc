@@ -40,13 +40,19 @@ from cinder.openstack.common import timeutils
 from cinder.openstack.common import units
 from cinder import utils
 from cinder.volume import utils as volume_utils
-
+import requests
+import time
 LOG = logging.getLogger(__name__)
 
 image_helper_opt = [cfg.StrOpt('image_conversion_dir',
                                default='$state_path/conversion',
                                help='Directory used for temporary storage '
-                                    'during image conversion'), ]
+                                    'during image conversion'),
+                    cfg.StrOpt('store_file_dir',
+                               default='/home/upload',
+                               help='Directory used for temporary storage '
+                                    'during migrate volume')
+                   ]
 
 CONF = cfg.CONF
 CONF.register_opts(image_helper_opt)
@@ -176,7 +182,80 @@ def fetch_to_vhd(context, image_service,
                  user_id=None, project_id=None):
     fetch_to_volume_format(context, image_service, image_id, dest, 'vpc',
                            blocksize, user_id, project_id)
+def fetch_from_localfile_to_raw(context, image_service,
+                 image_id,source_dir, dest, blocksize,
+                 user_id=None, project_id=None, size=None, run_as_root=True):
+    LOG.error('begin time of fetch_from_localfile_to_raw is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+    image_meta = image_service.show(context, image_id)
+    file_name=image_meta.get('id')
+    volume_format='raw'
+#     if (CONF.local_file_dir and not
+#             os.path.exists(CONF.local_file_dir)):
+#         raise exception.ImageUnacceptable(
+#             reason=_("the dir of back file of image doesn't exist"),
+#             image_id=image_id)
+    
+    tmp= source_dir + '/'+file_name
+    #tmp='/home/upload/d5414dfe-b6b0-4286-8a23-5867d84f8f27'
+#     if not os.path.exists(CONF.local_file_dir):
+#         raise exception.ImageUnacceptable(
+#             reason=_("the back file of image doesn't exist"),
+#             image_id=image_id)
+    if is_xenserver_image(context, image_service, image_id):
+            replace_xenserver_image_with_coalesced_vhd(tmp)
+    
+    data = qemu_img_info(tmp)
+    virt_size = data.virtual_size / units.Gi
 
+    # NOTE(xqueralt): If the image virtual size doesn't fit in the
+    # requested volume there is no point on resizing it because it will
+    # generate an unusable image.
+    if size is not None and virt_size > size:
+        params = {'image_size': virt_size, 'volume_size': size}
+        reason = _("Size is %(image_size)dGB and doesn't fit in a "
+                   "volume of size %(volume_size)dGB.") % params
+        raise exception.ImageUnacceptable(image_id=image_id, reason=reason)
+
+    fmt = data.file_format
+    if fmt is None:
+        raise exception.ImageUnacceptable(
+            reason=_("'qemu-img info' parsing failed."),
+            image_id=image_id)
+
+    backing_file = data.backing_file
+    if backing_file is not None:
+        raise exception.ImageUnacceptable(
+            image_id=image_id,
+            reason=_("fmt=%(fmt)s backed by:%(backing_file)s")
+            % {'fmt': fmt, 'backing_file': backing_file, })
+
+    # NOTE(jdg): I'm using qemu-img convert to write
+    # to the volume regardless if it *needs* conversion or not
+    # TODO(avishay): We can speed this up by checking if the image is raw
+    # and if so, writing directly to the device. However, we need to keep
+    # check via 'qemu-img info' that what we copied was in fact a raw
+    # image and not a different format with a backing file, which may be
+    # malicious.
+    LOG.debug("%s was %s, converting to %s " % (image_id, fmt,
+                                                volume_format))
+    convert_image(tmp, dest, volume_format)
+    
+    data = qemu_img_info(dest)
+    if data.file_format != volume_format:
+        raise exception.ImageUnacceptable(
+            image_id=image_id,
+            reason=_("Converted to %(vol_format)s, but format is "
+                     "now %(file_format)s") % {'vol_format': volume_format,
+                                               'file_format': data.
+                                               file_format})
+    try:       
+        LOG.debug('begin delete the image file %s'%tmp)
+        cmd = ('rm', '-rf', '%s' %tmp) 
+        utils.execute(*cmd, run_as_root=True)
+        #fileutils.delete_if_exists(tmp)
+    except:
+        LOG.warning('delete the image %s tmp file failed' %image_id)
+    LOG.error('end time of fetch_from_localfile_to_raw is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
 
 def fetch_to_raw(context, image_service,
                  image_id, dest, blocksize,
@@ -324,8 +403,59 @@ def upload_volume(context, image_service, image_meta, volume_path,
 
         with fileutils.file_open(tmp, 'rb') as image_file:
             image_service.update(context, image_id, {}, image_file)
-        fileutils.delete_if_exists(tmp)
+            
+def upload_volume_to_vgw(context,image_service, image_meta, volume_path,volume,vgw_url,
+                  volume_format='raw', run_as_root=True):
+    LOG.error('begin time of upload_volume_to_vgw is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+    image_id = image_meta['id']
+    volume_id = volume['id']
+    if (image_meta['disk_format'] == volume_format):
+        LOG.debug("%s was %s, no need to convert to %s" %
+                  (image_id, volume_format, image_meta['disk_format']))
+        if os.name == 'nt' or os.access(volume_path, os.R_OK):
+            with fileutils.file_open(volume_path, 'rb') as files:
+                r = requests.post(vgw_url, data=files)
+                if r.status_code !=200:
+                    #LOG.error('upload file  %s  to %s failed' %(file_name,vgw_url))
+                    raise exception.ImageUnacceptable(
+                            reason=("upload the volume %s back_file failed" %volume_id))
+        else:
+            with utils.temporary_chown(volume_path):
+                with fileutils.file_open(volume_path) as files:
+                    r = requests.post(vgw_url, data=files)
+                    #LOG.debug('the request result is %s' %(str(r.status_code)))
+                    if r.status_code !=200:
+                        #LOG.error('upload file  %s  to %s failed' %(file_name,vgw_url))
+                        raise exception.ImageUnacceptable(
+                                reason=("upload the volume %s back_file failed" %volume_id))
+        return
+    
+    with temporary_file() as tmp:
+        LOG.debug("%s was %s, converting to %s" %
+                  (image_id, volume_format, image_meta['disk_format']))
+        LOG.error('begin time of convert_image is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+        convert_image(volume_path, tmp, image_meta['disk_format']
+                      )
+        LOG.error('end time of upload_volume_to_vgw is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+        data = qemu_img_info(tmp)
+        if data.file_format != image_meta['disk_format']:
+            raise exception.ImageUnacceptable(
+                image_id=image_id,
+                reason=_("Converted to %(f1)s, but format is now %(f2)s") %
+                {'f1': image_meta['disk_format'], 'f2': data.file_format})
 
+        with fileutils.file_open(tmp, 'rb') as files:
+            LOG.error('begin time of upload file is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+            r = requests.post(vgw_url, data=files)
+            #LOG.debug('the request result is %' %(str(r.status_code)))
+            if r.status_code !=200:
+                #LOG.error('upload file  %s  to %s failed' %(file_name,vgw_url))
+                raise exception.ImageUnacceptable(
+                        reason=("upload the volume %s back_file failed" %volume_id))
+            LOG.error('end time of upload file is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))   
+    #todo delete the tmp file
+    fileutils.delete_if_exists(tmp)
+    LOG.error('end time of upload_volume_to_vgw is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
 
 def is_xenserver_image(context, image_service, image_id):
     image_meta = image_service.show(context, image_id)

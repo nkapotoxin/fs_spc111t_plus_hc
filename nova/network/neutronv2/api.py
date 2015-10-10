@@ -585,7 +585,11 @@ class API(base_api.NetworkAPI):
 
     def list_ports(self, context, **search_opts):
         """List ports for the client based on search options."""
-        return neutronv2.get_client(context).list_ports(**search_opts)
+        return neutronv2.get_client(context).list_ports(**search_opts)  
+    
+    def list_floatingips(self, context, **search_opts):
+        """List ports for the client based on search options."""
+        return neutronv2.get_client(context).list_floatingips(**search_opts)
 
     def show_port(self, context, port_id):
         """Return the port for the client given the port id."""

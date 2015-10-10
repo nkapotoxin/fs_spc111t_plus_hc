@@ -111,14 +111,26 @@ class API(base.Base):
         services = self.db.service_get_all_by_topic(ctxt, topic)
         return [srv['host'] for srv in services if not srv['disabled']]
 
+    def _check_volume_availability(self, volume, force):
+        """Check if the volume can be used."""
+        if volume['status'] not in ['available', 'in-use']:
+            msg = _('Volume to be backed up must be available/in-use.')
+            raise exception.InvalidVolume(reason=msg)
+        if not force and 'in-use' == volume['status']:
+            msg = _('Volume to be backed up is in-use, try forcing.')
+            raise exception.InvalidVolume(reason=msg)
+
     def create(self, context, name, description, volume_id,
-               container, availability_zone=None):
+               container, availability_zone=None, force=False):
         """Make the RPC call to create a volume backup."""
         check_policy(context, 'create')
         volume = self.volume_api.get(context, volume_id)
-        if volume['status'] != "available":
+        'comment it to enable force backup'
+        '''if volume['status'] != "available":
             msg = _('Volume to be backed up must be available')
-            raise exception.InvalidVolume(reason=msg)
+            raise exception.InvalidVolume(reason=msg)'''
+        self._check_volume_availability(volume, force)
+
         volume_host = volume_utils.extract_host(volume['host'], 'host')
         if not self._is_backup_service_enabled(volume, volume_host):
             raise exception.ServiceNotFound(service_id='cinder-backup')
@@ -159,8 +171,8 @@ class API(base.Base):
                                     'd_consumed': _consumed(over)})
                     raise exception.BackupLimitExceeded(
                         allowed=quotas[over])
-
-        self.db.volume_update(context, volume_id, {'status': 'backing-up'})
+        'comment it to enable force backup'
+        '''self.db.volume_update(context, volume_id, {'status': 'backing-up'})'''
         options = {'user_id': context.user_id,
                    'project_id': context.project_id,
                    'display_name': name,
@@ -190,7 +202,8 @@ class API(base.Base):
 
         return backup
 
-    def restore(self, context, backup_id, volume_id=None):
+    def restore(self, context, backup_id, volume_id=None,
+                availability_zone=None, description=None):
         """Make the RPC call to restore a volume backup."""
         check_policy(context, 'restore')
         backup = self.get(context, backup_id)
@@ -213,7 +226,9 @@ class API(base.Base):
                        "backup %(backup_id)s"),
                      {'size': size, 'backup_id': backup_id},
                      context=context)
-            volume = self.volume_api.create(context, size, name, description)
+            # TODO: specify the target volume's volume_type
+            volume = self.volume_api.create(context, size, name, description,
+                                            availability_zone=availability_zone)
             volume_id = volume['id']
 
             while True:
