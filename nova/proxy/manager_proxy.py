@@ -36,6 +36,7 @@ import sys
 import time
 import traceback
 import uuid
+import ast
 
 from cinderclient import exceptions as cinder_exception
 from novaclient import exceptions as nova_exception
@@ -107,6 +108,7 @@ from neutronclient.v2_0 import client as clientv20
 from ceilometerclient import client as ceilometerclient
 from neutronclient.common.exceptions import NeutronClientException
 from neutronclient.common import exceptions as neutron_exc
+from keystone.proxy.keystone_proxy import KeystoneProxy
 
 compute_opts = [
     cfg.StrOpt('console_host',
@@ -451,13 +453,14 @@ def wrap_instance_event(function):
 
     return decorated_function
 
+cascaded_keystone_auth_url = 'https://identity.az01.shenzhen--fusionsphere.huawei.com:443/identity/v2.0'
 
 def get_nova_sync_client():
     kwargs = {
         'username': CONF.nova_admin_username,
         'password': CONF.nova_admin_password,
         'tenant': CONF.nova_admin_tenant_name,
-        'auth_url': CONF.keystone_auth_url,
+        'auth_url': cascaded_keystone_auth_url,
         'region_name': CONF.proxy_region_name
     }
     req_context = compute_context.RequestContext(**kwargs)
@@ -732,6 +735,120 @@ class ComputeVirtAPI(virtapi.VirtAPI):
                 if decision is False:
                     break
 
+class CascadingKeystoneService(object):
+
+    def __init__(self):
+        self.cascading_keystone_client = self.get_cascading_keystone_client()
+        self.tenants_manager = self.cascading_keystone_client.tenants
+        self.users_manager = self.cascading_keystone_client.users
+
+    def get_keystone_credentials(self):
+        d = {}
+        d['version'] = '2'
+        d['username'] = CONF.nova_admin_username
+        d['password'] = CONF.nova_admin_password
+        d['auth_url'] = CONF.keystone_auth_url
+        d['tenant'] = CONF.nova_admin_tenant_name
+        if CONF.os_region_name is not None:
+            d['region_name'] = CONF.os_region_name
+
+        return d
+
+    def get_cascading_keystone_client(self):
+        """
+        kwargs = {
+            'username': CONF.nova_admin_username,
+            'password': CONF.nova_admin_password,
+            'tenant': CONF.nova_admin_tenant_name,
+            'auth_url': CONF.keystone_auth_url,
+            'region_name': CONF.proxy_region_name
+        }
+
+        :param args:
+        :return:
+        """
+        kwargs = self.get_keystone_credentials()
+
+        LOG.debug('Nash_get_cascading_keystone_client, kwargs: %s' % kwargs)
+        req_context = compute_context.RequestContext(**kwargs)
+        openstack_clients = clients.OpenStackClients(req_context)
+
+        return openstack_clients.keystone().client_v2
+
+    def get_tenant_detail(self, tenant_id):
+        return self.tenants_manager.get(tenant_id)
+
+    def list_tenants(self):
+        return self.tenants_manager.list()
+
+    def get_user(self, user_name):
+        find_user = None
+        users = self.users_manager.list()
+        for user in users:
+            if user.name == user_name:
+                find_user = user
+
+        return find_user
+
+    def get_tenant_id_by_tenant_name(self, tenant_name):
+        tenant_id = None
+        tenants = self.list_tenants()
+
+        if tenants:
+            for tenant in tenants:
+                if tenant.name == tenant_name:
+                    tenant_id = tenant.id
+                    break
+                else:
+                    continue
+
+        return tenant_id
+
+class IDTransferManager(object):
+
+    def __init__(self):
+        self.cascading_keystone_service = CascadingKeystoneService()
+
+    def get_user_of_specified_location(self, cascading_user, location):
+        cascading_user_info = self.cascading_keystone_service.get_user(cascading_user)
+        if cascading_user_info:
+            str_location_to_user = cascading_user_info.email
+            location_to_user = ast.literal_eval(str_location_to_user)
+
+            if location_to_user:
+                return location_to_user.get(location)
+            else:
+                return None
+        else:
+            return None
+
+    def get_cascaded_user(self, cascading_user):
+        proxy_region = CONF.proxy_region_name
+        return self.get_user_of_specified_location(cascading_user, proxy_region)
+
+    def get_tenant_of_specified_location(self, cascading_tenant, location):
+        """
+
+        :param cascading_tenant: string, tenant id of cascading tenant.
+        :param location: string, az name
+        :return:
+        """
+        cascading_tenant_detail = self.cascading_keystone_service.get_tenant_detail(cascading_tenant)
+        if cascading_tenant:
+            str_location_to_tenant = cascading_tenant_detail.description
+            location_to_tenant = ast.literal_eval(str_location_to_tenant)
+
+            if location_to_tenant:
+                return location_to_tenant.get(location)
+            else:
+                return None
+        else:
+            return None
+
+    def get_cascaded_tenant(self, cascading_tenant):
+        proxy_region = CONF.proxy_region_name
+        return self.get_tenant_of_specified_location(cascading_tenant, proxy_region)
+
 
 class ComputeManager(manager.Manager):
     """Manages the running instances from creation to destruction."""
@@ -777,8 +894,12 @@ class ComputeManager(manager.Manager):
         self._syncs_in_progress = {}
         self.sync_nova_client = get_nova_sync_client()
         self.csg_nova_client = get_nova_csg_client()
-        self.csd_neutron_client = ComputeManager.get_neutron_client(CONF.proxy_region_name)
-        self.csg_neutron_client = ComputeManager.get_neutron_client(CONF.os_region_name)
+
+        # self.csd_neutron_client = ComputeManager.get_neutron_client(CONF.proxy_region_name)
+        self.csd_neutron_client = ComputeManager.get_cascaded_neutron_client()
+        # self.csg_neutron_client = ComputeManager.get_neutron_client(CONF.os_region_name)
+        self.csg_neutron_client = ComputeManager.get_cascading_neutron_client()
+
         self.init_instance_finish = False
         self.heal_all_instances_marker = None
 
@@ -1091,10 +1212,56 @@ class ComputeManager(manager.Manager):
         return ks_clients.neutron()
 
     @staticmethod
-    def _get_neutron_python_client(context, regNam, neutrol_url):
+    def get_neutron_credentials(username, password, tenant, auth_url, region_name):
+        kwargs = {
+            'username': username,
+            'password': password,
+            'tenant': tenant,
+            'auth_url': auth_url,
+            'region_name': region_name
+        }
+
+        return kwargs
+
+    @staticmethod
+    def get_cascaded_neutron_credentials():
+        return ComputeManager.get_neutron_credentials(CONF.neutron.admin_username,
+                                            CONF.neutron.admin_password,
+                                            CONF.neutron.admin_tenant_name,
+                                            cascaded_keystone_auth_url,
+                                            CONF.proxy_region_name)
+
+    @staticmethod
+    def get_cascading_neutron_credentials():
+        return ComputeManager.get_neutron_credentials(CONF.neutron.admin_username,
+                                            CONF.neutron.admin_password,
+                                            CONF.neutron.admin_tenant_name,
+                                            CONF.keystone_auth_url,
+                                            CONF.os_region_name)
+
+    @staticmethod
+    def get_neutron_client_v2(kwargs):
+        req_context = compute_context.RequestContext(**kwargs)
+        ks_clients = clients.OpenStackClients(req_context)
+        return ks_clients.neutron()
+
+    @staticmethod
+    def get_cascaded_neutron_client():
+        cascaded_credentials = ComputeManager.get_cascaded_neutron_credentials()
+        cascaded_neutron_client = ComputeManager.get_neutron_client_v2(cascaded_credentials)
+        return cascaded_neutron_client
+
+    @staticmethod
+    def get_cascading_neutron_client():
+        cascading_credentials = ComputeManager.get_cascading_neutron_credentials()
+        cascading_neutron_client = ComputeManager.get_neutron_client_v2(cascading_credentials)
+        return cascading_neutron_client
+
+    @staticmethod
+    def _get_neutron_python_client(context, regNam, neutron_url):
         try:
             kwargs = {
-                'endpoint_url': neutrol_url,
+                'endpoint_url': neutron_url,
                 'timeout': CONF.neutron.url_timeout,
                 'insecure': CONF.neutron.api_insecure,
                 'ca_cert': CONF.neutron.ca_certificates_file,
@@ -1116,16 +1283,25 @@ class ComputeManager(manager.Manager):
 
     def _get_nova_python_client(self, context, reg_name=None, nova_url=None):
         try:
+            region = reg_name or CONF.proxy_region_name
+            #Following params need to transfer value of cascading in context to cascaded value.
+            id_transfer = IDTransferManager()
+            cascaded_user_name = id_transfer.get_cascaded_user(context.user_name)
+            token = str(context.auth_token)
+            cascaded_auth_token = KeystoneProxy.get_token_by_location(token, region)
+            cascaded_tenant_id = id_transfer.get_cascaded_tenant(context.tenant)
+
             kwargs = {
-                'auth_token': context.auth_token,
-                'username': context.user_name,
-                'tenant_id': context.tenant,
-                'auth_url': cfg.CONF.keystone_auth_url,
+                'auth_token': cascaded_auth_token,
+                'username': cascaded_user_name,
+                'tenant_id': cascaded_tenant_id,
+                'auth_url': cascaded_keystone_auth_url,
                 'roles': context.roles,
                 'is_admin': context.is_admin,
                 'region_name': reg_name or CONF.proxy_region_name,
                 'nova_url': nova_url or CONF.cascaded_nova_url,
             }
+            LOG.debug('Nash__get_nova_python_client, kwargs: %s' % kwargs)
             req_context = compute_context.RequestContext(**kwargs)
             openstack_clients = clients.OpenStackClients(req_context)
             return openstack_clients.nova()
@@ -1143,6 +1319,7 @@ class ComputeManager(manager.Manager):
             os_username=CONF.neutron.admin_username,
             os_endpoint_type=endpoint_value,
             insecure=True)
+        LOG.debug('Nash, get_ceilometer_client, kwargs: %s' % creds)
         ceiloclient = ceilometerclient.get_client(2, **creds)
         return ceiloclient
 
@@ -1159,18 +1336,67 @@ class ComputeManager(manager.Manager):
         ks_clients = clients.OpenStackClients(req_context)
         return ks_clients.cinder()
 
+    @staticmethod
+    def get_credentials(username, password, tenant, auth_url, region_name):
+        kwargs = {
+            'username': username,
+            'password': password,
+            'tenant': tenant,
+            'auth_url': auth_url,
+            'region_name': region_name
+        }
+
+        return kwargs
+
+    @staticmethod
+    def get_cinder_credentials(username, password, tenant, auth_url, region_name):
+        return ComputeManager.get_credentials(username, password, tenant, auth_url, region_name)
+
+    @staticmethod
+    def get_cinder_client_v2(kwargs):
+        req_context = compute_context.RequestContext(**kwargs)
+        ks_clients = clients.OpenStackClients(req_context)
+        return ks_clients.cinder()
+
+    @staticmethod
+    def get_cascading_cinder_credentials():
+        return ComputeManager.get_cinder_credentials(CONF.neutron.admin_username,
+                                                     CONF.neutron.admin_password,
+                                                     CONF.neutron.admin_tenant_name,
+                                                     CONF.neutron.admin_auth_url,
+                                                     CONF.os_region_name)
+
+    @staticmethod
+    def get_cascaded_cinder_credentials():
+        return ComputeManager.get_cinder_credentials(CONF.neutron.admin_username,
+                                                     CONF.neutron.admin_password,
+                                                     CONF.neutron.admin_tenant_name,
+                                                     cascaded_keystone_auth_url,
+                                                     CONF.proxy_region_name)
+
+    @staticmethod
+    def get_cascading_cinder_client():
+        cascading_credentials = ComputeManager.get_cascading_neutron_credentials()
+        return ComputeManager.get_cinder_client_v2(cascading_credentials)
+
+    @staticmethod
+    def get_cascaded_cinder_client():
+        cascaded_credentials = ComputeManager.get_cascaded_neutron_credentials()
+        return ComputeManager.get_cinder_client_v2(cascaded_credentials)
+
     def _get_csd_cinder_client(self, context, cinder_url=None):
         try:
             kwargs = {
                 'auth_token': context.auth_token,
                 'username': context.user_name,
                 'tenant_id': context.tenant,
-                'auth_url': cfg.CONF.keystone_auth_url,
+                'auth_url': cascaded_keystone_auth_url,
                 'roles': context.roles,
                 'is_admin': context.is_admin,
                 'region_name': CONF.proxy_region_name,
                 'cinder_url': cinder_url or CONF.cascaded_cinder_url,
             }
+            LOG.debug('Nash, _get_csd_cinder_client, kwargs %s' % kwargs)
             req_context = compute_context.RequestContext(**kwargs)
             openstack_clients = clients.OpenStackClients(req_context)
             return openstack_clients.cinder()
@@ -3365,7 +3591,8 @@ class ComputeManager(manager.Manager):
             self.volume_api.reserve_volume(context, volume_id)
             
             # Transfer the tenant of volume to current tenant
-            csd_cinder_admin_client = self.get_cinder_client(CONF.proxy_region_name)
+            # csd_cinder_admin_client = self.get_cinder_client(CONF.proxy_region_name)
+            csd_cinder_admin_client = ComputeManager.get_cascaded_cinder_client()
             csd_cinder_client = self._get_csd_cinder_client(context, cinder_url=CONF.cascaded_cinder_url)
             transfer = csd_cinder_admin_client.transfers.create(proxy_volume_id)
             csd_cinder_client.transfers.accept(transfer.id, transfer.auth_key)
@@ -3397,7 +3624,8 @@ class ComputeManager(manager.Manager):
                                                                 ''.join([my_host, '#', _backend_name]))
             
             # Transfer the tenant of volume to current tenant
-            csd_cinder_admin_client = self.get_cinder_client(CONF.proxy_region_name)
+            # csd_cinder_admin_client = self.get_cinder_client(CONF.proxy_region_name)
+            csd_cinder_admin_client = ComputeManager.get_cascaded_cinder_client()
             csd_cinder_client = self._get_csd_cinder_client(context, cinder_url=CONF.cascaded_cinder_url)
             transfer = csd_cinder_admin_client.transfers.create(proxy_volume_id)
             csd_cinder_client.transfers.accept(transfer.id, transfer.auth_key)
@@ -3542,7 +3770,8 @@ class ComputeManager(manager.Manager):
             block_device_mapping_v2_lst = []
             block_device_mapping = request_spec['block_device_mapping']
             if block_device_mapping:
-                csg_cinder_client = self.get_cinder_client(CONF.os_region_name)
+                # csg_cinder_client = self.get_cinder_client(CONF.os_region_name)
+                csg_cinder_client = ComputeManager.get_cascading_cinder_client()
             for bdm in block_device_mapping:
                 if bdm['source_type'] == 'volume':
                     bdm_value = self._create_vol_device_mapping(context,
@@ -3550,7 +3779,8 @@ class ComputeManager(manager.Manager):
                                                                 csg_cinder_client)
                     if bdm_value:
                         try:
-                            csd_cinder_client = self.get_cinder_client(CONF.proxy_region_name)
+                            # csd_cinder_client = self.get_cinder_client(CONF.proxy_region_name)
+                            csd_cinder_client = ComputeManager.get_cascaded_cinder_client()
                             csd_cinder_client.volumes.set_bootable(bdm_value['uuid'],
                                                                    self._get_bootable_property
                                                                    (bdm.volume_id, csg_cinder_client))
@@ -5644,7 +5874,8 @@ class ComputeManager(manager.Manager):
 
         proxy_volume_id = None
         try:
-            csg_cinder_client = self.get_cinder_client(CONF.os_region_name)
+            # csg_cinder_client = self.get_cinder_client(CONF.os_region_name)
+            csg_cinder_client = ComputeManager.get_cascading_cinder_client()
             volume = csg_cinder_client.volumes.get(bdm.volume_id)
             proxy_volume_id = self._get_proxy_volume_id(context,csg_cinder_client,
                                                           bdm.volume_id,
@@ -5684,7 +5915,8 @@ class ComputeManager(manager.Manager):
                 self.volume_api.unreserve_volume(context, bdm.volume_id)
 
         attach_data = dict(success=False, retry=0, retry_max=60, loop_time=5)
-        csd_cinder_cli = self.get_cinder_client(CONF.proxy_region_name)
+        # csd_cinder_cli = self.get_cinder_client(CONF.proxy_region_name)
+        csd_cinder_cli = ComputeManager.get_cascaded_cinder_client()
 
         def _ensure_attach():
             if attach_data['retry'] > attach_data['retry_max']:
@@ -5766,7 +5998,8 @@ class ComputeManager(manager.Manager):
         csd_instance_uuid = None
         try:
             try:
-                csg_cinder_client = self.get_cinder_client(CONF.os_region_name)
+                # csg_cinder_client = self.get_cinder_client(CONF.os_region_name)
+                csg_cinder_client = ComputeManager.get_cascading_cinder_client()
                 body_response = csg_cinder_client.volumes.get(volume_id)
                 proxy_volume_id = self._fetch_proxy_volume_id(context,
                                                               csg_cinder_client,
@@ -5799,7 +6032,8 @@ class ComputeManager(manager.Manager):
                 self.volume_api.roll_detaching(context, volume_id)
 
         detach_data = dict(success=False, retry=0, retry_max=60, loop_time=5)
-        csd_cinder_cli = self.get_cinder_client(CONF.proxy_region_name)
+        # csd_cinder_cli = self.get_cinder_client(CONF.proxy_region_name)
+        csd_cinder_cli = ComputeManager.get_cascaded_cinder_client()
 
         def _ensure_detach():
             if detach_data['retry'] > detach_data['retry_max']:
