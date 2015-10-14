@@ -828,6 +828,7 @@ class IDTransferManager(object):
 
     def get_tenant_of_specified_location(self, cascading_tenant, location):
         """
+        Transfer cascading tenant id to tenant id in specified location.
 
         :param cascading_tenant: string, tenant id of cascading tenant.
         :param location: string, az name
@@ -846,6 +847,12 @@ class IDTransferManager(object):
             return None
 
     def get_cascaded_tenant(self, cascading_tenant):
+        """
+        transfer cascading tenant id to cascaded tenant id.
+
+        :param cascading_tenant: string, tenant id of cascading layer.
+        :return: string, tenant id of cascaded node which mapping local proxy.
+        """
         proxy_region = CONF.proxy_region_name
         return self.get_tenant_of_specified_location(cascading_tenant, proxy_region)
 
@@ -1916,7 +1923,10 @@ class ComputeManager(manager.Manager):
                         fixed_ips.append({'ip_address': address})
             # use cascading vif id directly.
             csg_port_name = ComputeManager._gen_csd_nets_name('port', netObj['id'] or '')
-            req_body = {'port': {'tenant_id': instance['project_id'],
+            cascaded_tenant_id = IDTransferManager().get_cascaded_tenant(instance['project_id'])
+            req_body = {'port': {
+                                 #'tenant_id': instance['project_id'],
+                                 'tenant_id': cascaded_tenant_id,
                                  'admin_state_up': True,
                                  'name': csg_port_name,
                                  'network_id': physical_net_id,
