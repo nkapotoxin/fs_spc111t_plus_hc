@@ -40,6 +40,7 @@ import time
 import datetime
 import random
 import traceback
+import ast
 
 from oslo.config import cfg
 from oslo import messaging
@@ -67,14 +68,19 @@ from ceilometerclient import client as ceilometerclient
 from cinderclient import exceptions as cinder_exception
 from cinder.volume import rpcapi as volume_rpcapi
 from cinder.openstack.common import threadgroup
+from cinder.proxy import compute_context
+from cinder.proxy import clients
 
 import eventlet
 from eventlet.greenpool import GreenPool
 from keystoneclient.v2_0 import client as kc
 from keystoneclient import exceptions as keystone_exception
+from keystone.proxy.keystone_proxy import KeystoneProxy
 from cinderclient import client as client_cinder
 
 LOG = logging.getLogger(__name__)
+
+cascaded_auth_url = 'https://identity.az01.shenzhen--fusionsphere.huawei.com:443/identity/v2.0'
 
 QUOTAS = quota.QUOTAS
 CGQUOTAS = quota.CGQUOTAS
@@ -148,6 +154,9 @@ volume_manager_opts = [
     cfg.StrOpt('cascaded_region_name',
                default='RegionOne',
                help='Region name of this node'),
+    cfg.StrOpt('cascaded_cinder_url',
+               default='',
+               help='cascaded cinder public url')
 ]
 CONF = cfg.CONF
 CONF.register_opts(volume_manager_opts)
@@ -195,6 +204,127 @@ def locked_snapshot_operation(f):
         return lso_inner2(inst, context, snapshot_id, **kwargs)
     return lso_inner1
 
+
+class CascadingKeystoneService(object):
+
+    def __init__(self):
+        self.cascading_keystone_client = self.get_cascading_keystone_client()
+        self.tenants_manager = self.cascading_keystone_client.tenants
+        self.users_manager = self.cascading_keystone_client.users
+
+    def get_keystone_credentials(self):
+        d = {}
+        d['version'] = '2'
+        d['username'] = CONF.cinder_username
+        d['password'] = CONF.admin_password
+        d['auth_url'] = CONF.keystone_auth_url
+        d['tenant'] = CONF.cinder_tenant_name
+        if CONF.os_region_name is not None:
+            d['region_name'] = CONF.os_region_name
+
+        return d
+
+    def get_cascading_keystone_client(self):
+        """
+        kwargs = {
+            'username': CONF.cinder_username,
+            'password': CONF.admin_password,
+            'tenant': CONF.cinder_tenant_name,
+            'auth_url': CONF.keystone_auth_url,
+            'region_name': CONF.cascaded_region_name
+        }
+
+        :param args:
+        :return:
+        """
+        kwargs = self.get_keystone_credentials()
+        req_context = compute_context.RequestContext(**kwargs)
+        openstack_clients = clients.OpenStackClients(req_context)
+
+        return openstack_clients.keystone().client_v2
+
+    def get_tenant_detail(self, tenant_id):
+        return self.tenants_manager.get(tenant_id)
+
+    def list_tenants(self):
+        return self.tenants_manager.list()
+
+    def get_user(self, user_name):
+        find_user = None
+        users = self.users_manager.list()
+        for user in users:
+            if user.name == user_name:
+                find_user = user
+
+        return find_user
+
+    def get_tenant_id_by_tenant_name(self, tenant_name):
+        tenant_id = None
+        tenants = self.list_tenants()
+
+        if tenants:
+            for tenant in tenants:
+                if tenant.name == tenant_name:
+                    tenant_id = tenant.id
+                    break
+                else:
+                    continue
+
+        return tenant_id
+
+
+class IDTransferManager(object):
+
+    def __init__(self):
+        self.cascading_keystone_service = CascadingKeystoneService()
+
+    def get_user_of_specified_location(self, cascading_user, location):
+        cascading_user_info = self.cascading_keystone_service.get_user(cascading_user)
+        if cascading_user_info:
+            str_location_to_user = cascading_user_info.email
+            location_to_user = ast.literal_eval(str_location_to_user)
+
+            if location_to_user:
+                return location_to_user.get(location)
+            else:
+                return None
+        else:
+            return None
+
+    def get_cascaded_user(self, cascading_user):
+        proxy_region = CONF.cascaded_region_name
+        return self.get_user_of_specified_location(cascading_user, proxy_region)
+
+    def get_tenant_of_specified_location(self, cascading_tenant, location):
+        """
+        Transfer cascading tenant id to tenant id in specified location.
+
+        :param cascading_tenant: string, tenant id of cascading tenant.
+        :param location: string, az name
+        :return:
+        """
+        cascading_tenant_detail = self.cascading_keystone_service.get_tenant_detail(cascading_tenant)
+        if cascading_tenant:
+            str_location_to_tenant = cascading_tenant_detail.description
+            location_to_tenant = ast.literal_eval(str_location_to_tenant)
+
+            if location_to_tenant:
+                return location_to_tenant.get(location)
+            else:
+                return None
+        else:
+            return None
+
+    def get_cascaded_tenant(self, cascading_tenant):
+        """
+        transfer cascading tenant id to cascaded tenant id.
+
+        :param cascading_tenant: string, tenant id of cascading layer.
+        :return: string, tenant id of cascaded node which mapping local proxy.
+        """
+        proxy_region = CONF.cascaded_region_name
+        return self.get_tenant_of_specified_location(cascading_tenant, proxy_region)
+
 class CinderProxy(manager.SchedulerDependentManager):
 
     """Manages attachable block storage devices."""
@@ -229,6 +359,7 @@ class CinderProxy(manager.SchedulerDependentManager):
         self.sync_volumes = []
         self.tg = threadgroup.ThreadGroup()
         self.tenant_id = self._get_tenant_id()
+        self.cascaded_tenant_id = IDTransferManager().get_cascaded_tenant(self.tenant_id)
         self.image_service = glance.get_default_image_service()
         self.adminCinderClient = self._get_cascaded_cinder_client()
         self._init_volume_mapping_cache()
@@ -708,52 +839,89 @@ class CinderProxy(manager.SchedulerDependentManager):
     
     def _get_management_url(self, kc, **kwargs):
         return kc.service_catalog.url_for(**kwargs)
-        
-    def _get_cascaded_cinder_client(self, context=None):
+
+    def get_credentials(self, username, password, tenant, auth_url, region_name):
+        kwargs = {
+            'username': username,
+            'password': password,
+            'tenant': tenant,
+            'auth_url': auth_url,
+            'region_name': region_name
+        }
+
+        return kwargs
+
+    def get_cinder_credentials(self, username, password, tenant, auth_url, region_name):
+        return self.get_credentials(username, password, tenant, auth_url, region_name)
+
+    def get_cinder_client_v2(self, kwargs):
+        req_context = compute_context.RequestContext(**kwargs)
+        ks_clients = clients.OpenStackClients(req_context)
+        return ks_clients.cinder()
+
+    def get_cascading_cinder_credentials(self):
+        return self.get_cinder_credentials(CONF.cinder_username,
+                                                     CONF.admin_password,
+                                                     CONF.cinder_tenant_name,
+                                                     CONF.keystone_auth_url,
+                                                     CONF.os_region_name)
+
+    def get_cascaded_cinder_credentials(self):
+        return self.get_cinder_credentials(CONF.cinder_username,
+                                                     CONF.admin_password,
+                                                     CONF.cinder_tenant_name,
+                                                     cascaded_auth_url,
+                                                     CONF.cascaded_region_name)
+
+    def get_cascading_cinder_client_with_admin(self):
+        cascading_credentials = self.get_cascading_cinder_credentials()
+        return self.get_cinder_client_v2(cascading_credentials)
+
+    def get_cascaded_cinder_client_with_admin(self):
+        cascaded_credentials = self.get_cascaded_cinder_credentials()
+        return self.get_cinder_client_v2(cascaded_credentials)
+
+    def get_cascaded_cinder_client_with_context(self, context):
+        cinder_client = None
         try:
-            if context is None:                
-                cinderclient = cinder_client.Client(
-                    auth_url=CONF.keystone_auth_url,
-                    region_name=CONF.cascaded_region_name,
-                    tenant_id=self.tenant_id,
-                    api_key=CONF.admin_password,
-                    username=CONF.cinder_username,
-                    insecure=True,
-                    timeout=30,
-                    retries=3)
+            context_dict = context.to_dict()
+            cascading_tenant_id = context_dict.get('project_id')
+            cascading_user_id = context_dict.get('user_id')
+            cascading_auth_token = context_dict.get('auth_token')
+
+            id_transfer = IDTransferManager()
+            cascaded_tenant_id = id_transfer.get_cascaded_tenant(cascading_tenant_id)
+            cascaded_user = id_transfer.get_cascaded_user(cascading_user_id)
+            cascaded_auth_token = KeystoneProxy.get_token_by_location(cascading_auth_token, CONF.cascaded_region_name)
+
+            cascaded_credentials = {
+                'auth_token': cascaded_auth_token,
+                'username': cascaded_user,
+                'tenant_id': cascaded_tenant_id,
+                'auth_url': cascaded_auth_url,
+                'roles': context.roles,
+                'is_admin': context.is_admin,
+                'region_name': CONF.cascaded_region_name,
+                'cinder_url': CONF.cascaded_cinder_url,
+            }
+            req_context = compute_context.RequestContext(**cascaded_credentials)
+            openstack_clients = clients.OpenStackClients(req_context)
+            cinder_client = openstack_clients.cinder()
+        except Exception as e:
+            with excutils.save_and_reraise_exception():
+                LOG.error('Exception when get_cascaded_cinder_client_with_context, EXCEPTION: %s' %
+                          traceback.format_exc(e))
+
+        return cinder_client
+
+
+    def _get_cascaded_cinder_client(self, context=None):
+        cinder_client = None
+        try:
+            if context is None:
+                cinder_client = self.get_cascaded_cinder_client_with_admin()
             else:
-                ctx_dict = context.to_dict()
-
-                kwargs = {
-                    'auth_url': CONF.keystone_auth_url,
-                    'tenant_name': CONF.cinder_tenant_name,
-                    'username': CONF.cinder_username,
-                    'password': CONF.admin_password,
-                    'insecure': True
-                }
-                keystoneclient = kc.Client(**kwargs)
-                management_url = self._get_management_url(keystoneclient, service_type='volumev2',
-                                                      attr='region',
-                                                      endpoint_type='publicURL',
-                                                      filter_value=CONF.cascaded_region_name)
-                
-                LOG.info("before replace: management_url:%s", management_url)                                      
-                url = management_url.rpartition("/")[0]
-                management_url = url+ '/' + ctx_dict.get("project_id")
-
-                LOG.info("after replace: management_url:%s", management_url)  
-
-                cinderclient = cinder_client.Client(
-                username=ctx_dict.get('user_id'),
-                auth_url=cfg.CONF.keystone_auth_url,
-                insecure=True,
-                timeout=30,
-                retries=3)
-                cinderclient.client.auth_token = ctx_dict.get('auth_token')
-                cinderclient.client.management_url = management_url
-
-            LOG.info(_("cascade info: os_region_name:%s"), CONF.cascaded_region_name)
-            return cinderclient
+                cinder_client = self.get_cascaded_cinder_client_with_context(context)
         except keystone_exception.Unauthorized:
             with excutils.save_and_reraise_exception():
                 LOG.error(_('Token unauthorized failed for keystoneclient '
@@ -765,6 +933,8 @@ class CinderProxy(manager.SchedulerDependentManager):
         except Exception:
             with excutils.save_and_reraise_exception():
                 LOG.error(_('Failed to get cinder python client.'))
+
+        return cinder_client
 
     def _get_image_cascaded(self, context, image_id, cascaded_glance_url):
 
@@ -866,8 +1036,11 @@ class CinderProxy(manager.SchedulerDependentManager):
             display_description = volume_properties.get('display_description')
             volume_type_id = volume_properties.get('volume_type_id')
             share = volume_properties.get('shareable', False)
+            id_transfer = IDTransferManager()
             user_id = ctx_dict.get('user_id')
+            user_id = id_transfer.get_cascaded_user(user_id)
             project_id = ctx_dict.get('project_id')
+            project_id = id_transfer.get_cascaded_tenant(project_id)
 
             cascaded_snapshot_id = None
             if snapshot_id is not None:
