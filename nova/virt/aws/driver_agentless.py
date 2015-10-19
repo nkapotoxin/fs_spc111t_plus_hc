@@ -4,6 +4,7 @@ from oslo.config import cfg
 from nova.openstack.common import log as logging
 from driver import AwsEc2Driver
 from nova.network import neutronv2
+from libcloud.compute.base import NodeAuthSSHKey
 import base64
 
 # from nova.virt import hardware
@@ -30,6 +31,9 @@ class AwsAgentlessDriver(AwsEc2Driver):
         # the configuration
         self.hn_api = hypernode_api.HyperNodeAPI()
         self.provider_security_group_id = None
+
+    def _get_auth(self, key_data, key_name):
+        return NodeAuthSSHKey(key_data)
 
     @staticmethod
     def _binding_host(context, network_info, host_id):

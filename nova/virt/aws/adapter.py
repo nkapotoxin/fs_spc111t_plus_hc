@@ -264,7 +264,7 @@ class RetryDecorator(object):
                     except self._exceptions as e:
                         error_info='Second simultaneous read on fileno'
                         error_message= e.message
-                        retry_error_message=['','Tunnel connection failed: 503 Service Unavailable','timed out',
+                        retry_error_message=['','Tunnel connection failed: 503 Service Unavailable','time out',
                                              'Tunnel connection failed: 502 Bad Gateway',"'NoneType' object has no attribute 'makefile'"]
                         if error_message is None:
                             raise e
@@ -646,7 +646,7 @@ class Ec2Adapter(EC2NodeDriver):
         if 'auth' in kwargs and 'ex_keyname' in kwargs:
             raise AttributeError('Cannot specify auth and ex_keyname together')
 
-        if 'auth' in kwargs:
+        if 'auth' in kwargs and kwargs['auth'] is not None:
             auth = self._get_and_check_auth(kwargs['auth'])
             key = self.ex_find_or_import_keypair_by_key_material(auth.pubkey)
             params['KeyName'] = key['keyName']
