@@ -377,7 +377,16 @@ class VMwareVcloudDriver(driver.ComputeDriver):
         else:
             self._session._wait_for_task(task)
             return True
-
+        
+    def _modify_vm_cpu(self,the_vapp,cpus):
+        task = the_vapp.modify_vm_cpu(the_vapp.name, cpus)
+        if not task:
+            raise exception.NovaException(
+                "Unable to modify vm %s cpu" % the_vapp.name)
+        else:
+            self._session._wait_for_task(task)
+            return True
+        
     def init_host(self, host):
         return
 
@@ -706,7 +715,12 @@ class VMwareVcloudDriver(driver.ComputeDriver):
             connection_info = vol['connection_info']
             # unused param mountpoint, so i give a fake string of sdb
             self.attach_volume(context, connection_info, instance, '/dev/sdb')
-
+        
+        #modified cpu
+        if(instance.get_flavor().vcpus != 1):
+            the_vapp = self._get_vcloud_vapp(vapp_name)
+            if self._modify_vm_cpu(the_vapp, instance.get_flavor().vcpus):
+                LOG.info("modified %s cpu success" %vapp_name)
         # power on it
         self._power_on_vapp(self._get_vcloud_vapp(vapp_name))
 
