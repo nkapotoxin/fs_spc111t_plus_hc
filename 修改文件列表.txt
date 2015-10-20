@@ -1,0 +1,142 @@
+修改文件列表：
+
+├─cinder
+│  │  manager.py
+│  │  
+│  ├─api
+│  │  └─contrib
+│  │          backups.py
+│  │          
+│  ├─backup
+│  │  │  api.py
+│  │  │  cleanup-vol-backups.sh
+│  │  │  gen-vol-backups.sh
+│  │  │  manager.py
+│  │  │  
+│  │  └─drivers
+│  │          ceph.py
+│  │          
+│  ├─image
+│  │      image_utils.py
+│  │      
+│  ├─proxy
+│  │      cinder_backup_proxy.py
+│  │      cinder_proxy.py
+│  │      
+│  └─volume
+│      └─drivers
+│          ├─aws
+│          │      storage_gateway.py
+│          │      __init__.py
+│          │      
+│          ├─cephiscsi
+│          │      cephiscsi.py
+│          │      ceph_iscsi.sh
+│          │      muranoceph.sh
+│          │      __init__.py
+│          │      
+│          └─ec2
+│                  adapter.py
+│                  driver.py
+│                  ec2volume.py
+│                  exception_ex.py
+│                  __init__.py
+│                  
+├─cinderclient
+│  ├─v1
+│  │      shell.py
+│  │      volume_backups.py
+│  │      volume_backups_restore.py
+│  │      
+│  └─v2
+│          shell.py
+│          volume_backups.py
+│          volume_backups_restore.py
+│          
+├─config_files
+│  └─etc
+│      └─neutron
+│          └─others
+│              └─cfg_template
+│                      neutron-server.json
+│                      
+├─neutron
+│  ├─agent
+│  │  │  rpc.py
+│  │  │  
+│  │  └─linux
+│  │          ovs_lib.py
+│  │          
+│  ├─common
+│  │      config.py
+│  │      
+│  ├─db
+│  │      agents_db.py
+│  │      
+│  └─plugins
+│      ├─ml2
+│      │      rpc.py
+│      │      
+│      └─openvswitch
+│          ├─agent
+│          │      ovs_neutron_agent.py
+│          │      
+│          └─common
+│                  config.py
+│                  
+└─nova
+    ├─api
+    │  └─openstack
+    │      └─compute
+    │          └─contrib
+    │                  admin_actions.py
+    │                  
+    ├─compute
+    │      api.py
+    │      manager.py
+    │      vm_states.py
+    │      
+    ├─network
+    │  │  api.py
+    │  │  
+    │  └─neutronv2
+    │          api.py
+    │          
+    ├─proxy
+    │      manager_proxy.py
+    │      
+    └─virt
+        ├─aws
+        │      adapter.py
+        │      driver.py
+        │      driver_agentless.py
+        │      exception_ex.py
+        │      hypernode_api.py
+        │      hypernode_installer.py
+        │      sshclient.py
+        │      templatemanifest.xml
+        │      __init__.py
+        │      
+        ├─vcloudapi
+        │      driver.py
+        │      exceptions.py
+        │      network_utils.py
+        │      util.py
+        │      vcenter_utils.py
+        │      vcloudair.py
+        │      vcloud_network_utils.py
+        │      vcloud_task_states.py
+        │      vim_util.py
+        │      __init__.py
+        │      
+        ├─vmwareapi
+        │      driver.py
+        │      vmops.py
+        │      
+        └─vtep
+                aws_driver.py
+                driver.py
+                network_api.py
+                vcloud_driver.py
+                __init__.py
+                
