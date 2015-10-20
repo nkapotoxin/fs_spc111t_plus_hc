@@ -6,7 +6,7 @@ import shutil
 
 from oslo.config import cfg
 from libcloud.compute.types import StorageVolumeState,NodeState
-from libcloud.compute.base import NodeSize, NodeImage
+from libcloud.compute.base import NodeSize, NodeImage,NodeAuthSSHKey
 from libcloud.storage.types import ObjectDoesNotExistError
 import sshclient
 
@@ -213,8 +213,8 @@ class AwsEc2Driver(driver.ComputeDriver):
                 self.provider_security_group_id = CONF.provider_opts.security_group
 
         
-
-
+    def _get_auth(self, key_data, key_name):
+        return None
 
     def init_host(self, host):
         pass
@@ -556,7 +556,9 @@ class AwsEc2Driver(driver.ComputeDriver):
                                                                  # ex_subnet=provider_subnet_data,
                                                                  ex_blockdevicemappings=provider_bdms,
                                                                  ex_network_interfaces=self.provider_interfaces,
-                                                                 ex_userdata=user_data)
+                                                                 ex_userdata=user_data,
+                                                                 auth=self._get_auth(instance._key_data,
+                                                                                     instance._key_name))
             elif(len(self.provider_interfaces)==1):
 
                 provider_subnet_data_id = self.provider_interfaces[0].subnet_id
@@ -571,7 +573,9 @@ class AwsEc2Driver(driver.ComputeDriver):
                                                                  ex_security_group_ids=self.provider_security_group_id,
                                                                  ex_blockdevicemappings=provider_bdms,
                                                                  # ex_network_interfaces=self.provider_interfaces,
-                                                                 ex_userdata=user_data)
+                                                                 ex_userdata=user_data,
+                                                                 auth=self._get_auth(instance._key_data,
+                                                                                     instance._key_name))
             else:
                 provider_node = self.compute_adapter.create_node(name=provider_node_name,
                                                                  image=provider_image,
@@ -581,7 +585,9 @@ class AwsEc2Driver(driver.ComputeDriver):
                                                                  ex_security_group_ids=self.provider_security_group_id,
                                                                  ex_blockdevicemappings=provider_bdms,
                                                                  # ex_network_interfaces=self.provider_interfaces,
-                                                                 ex_userdata=user_data)
+                                                                 ex_userdata=user_data,
+                                                                 auth=self._get_auth(instance._key_data,
+                                                                                     instance._key_name))
 
         except Exception as e:
             LOG.warning('Provider instance is booting error')
@@ -685,7 +691,10 @@ class AwsEc2Driver(driver.ComputeDriver):
         provder_image = self.compute_adapter.get_image(CONF.provider_opts.base_linux_image)
         # 1.3. create_node, and get_node_stat, waiting for node creation finish
         provider_node_name = self._generate_provider_node_name(instance)
-        provider_node = self.compute_adapter.create_node(name=provider_node_name, image=provder_image, size=provider_size)
+        provider_node = self.compute_adapter.create_node(name=provider_node_name, image=provder_image,
+                                                         size=provider_size,
+                                                         auth=self._get_auth(instance._key_data,
+                                                                                     instance._key_name))
 
         # 2. power off the vm
         self.compute_adapter.ex_stop_node(provider_node)

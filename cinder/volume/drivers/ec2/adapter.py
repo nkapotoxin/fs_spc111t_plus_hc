@@ -647,7 +647,7 @@ class Ec2Adapter(EC2NodeDriver):
         if 'auth' in kwargs and 'ex_keyname' in kwargs:
             raise AttributeError('Cannot specify auth and ex_keyname together')
 
-        if 'auth' in kwargs:
+        if 'auth' in kwargs and kwargs['auth'] is not None:
             auth = self._get_and_check_auth(kwargs['auth'])
             key = self.ex_find_or_import_keypair_by_key_material(auth.pubkey)
             params['KeyName'] = key['keyName']

@@ -46,6 +46,7 @@ from nova.openstack.common import strutils
 from nova import network
 import eventlet
 from eventlet import greenthread
+from nova.network.security_group import openstack_driver
 
 LOG = logging.getLogger(__name__)
 
@@ -852,17 +853,22 @@ class MigrateThread(threading.Thread):
                 if floating_ip.get('floatingips',None):
                     floatingIp_fixIp_map[port['fixed_ips'][0].get('ip_address')]=floating_ip
         
-                
+        security_group_api = (
+            openstack_driver.get_openstack_security_group_driver())    
+        security_groups_info =  security_group_api.get_instance_security_groups(
+                self.context, instance['uuid'], True)
+         
+        security_groups = [str(group['name']) for group in security_groups_info]
         access_ip_v4 = instance.access_ip_v4  
         access_ip_v6 = instance.access_ip_v6
         min_count = 1
         max_count = 1
         
         name=instance.display_name
-        key_name = None
+        key_name = instance.key_name
         metadata = instance.metadata
         injected_files = []
-        security_group=instance.security_groups
+        security_group=security_groups
         user_data=instance.user_data
         
         flavor_id = instance.system_metadata['instance_type_flavorid']
