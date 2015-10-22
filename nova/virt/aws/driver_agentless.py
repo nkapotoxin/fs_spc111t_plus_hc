@@ -33,7 +33,9 @@ class AwsAgentlessDriver(AwsEc2Driver):
         self.provider_security_group_id = None
 
     def _get_auth(self, key_data, key_name):
-        return NodeAuthSSHKey(key_data)
+        if key_data:
+            return NodeAuthSSHKey(key_data)
+        return None
 
     @staticmethod
     def _binding_host(context, network_info, host_id):

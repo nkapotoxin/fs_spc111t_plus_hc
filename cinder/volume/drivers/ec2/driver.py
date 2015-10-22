@@ -150,7 +150,7 @@ class AwsEc2VolumeDriver(driver.VolumeDriver):
     def create_volume(self, volume):
         """Create a volume."""
         size = volume['size']
-        name = volume['name']
+        name = volume['display_name']
         location = self.adpter.get_location(self.configuration.availability_zone)
         if not location:
             raise exception_ex.ProviderLocationError
