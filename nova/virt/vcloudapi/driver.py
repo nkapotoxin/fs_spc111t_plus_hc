@@ -359,7 +359,9 @@ class VMwareVcloudDriver(driver.ComputeDriver):
             return False, 'disk not found'
         elif len(link) > 1:
             return False, 'more than one disks found with that name.'
-
+    
+    @RetryDecorator(max_retry_count=16,
+                    exceptions=exception.NovaException)
     def _attach_disk_to_vm(self, the_vapp, disk_ref):
         task = the_vapp.attach_disk_to_vm(the_vapp.name, disk_ref)
         if not task:
@@ -368,7 +370,9 @@ class VMwareVcloudDriver(driver.ComputeDriver):
         else:
             self._session._wait_for_task(task)
             return True
-
+    
+    @RetryDecorator(max_retry_count=16,
+                    exceptions=exception.NovaException)
     def _detach_disk_from_vm(self, the_vapp, disk_ref):
         task = the_vapp.detach_disk_from_vm(the_vapp.name, disk_ref)
         if not task:
