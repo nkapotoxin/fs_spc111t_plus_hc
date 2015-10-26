@@ -687,8 +687,8 @@ class MigrateThread(threading.Thread):
                     if image['status'] == 'error':
                         msg = _("migrate vm failed.")
                         raise exc.HTTPBadRequest(explanation=msg)
-                    query_cascaded_image_status_count = query_image_status_count-1
-                    if query_cascaded_image_status_count == 0 and image['status'] != 'active':
+                    query_image_status_count = query_image_status_count-1
+                    if query_image_status_count == 0 and image['status'] != 'active':
                         msg = _("migrate vm failed.")
                         raise exc.HTTPBadRequest(explanation=msg)
                 
