@@ -50,9 +50,6 @@ import glance.openstack.common.log as logging
 from glance.openstack.common import strutils
 import glance.registry.client.v1.api as registry
 
-import requests
-import httplib
-
 LOG = logging.getLogger(__name__)
 _LI = gettextutils._LI
 _LW = gettextutils._LW
@@ -66,19 +63,6 @@ CONF.import_opt('container_formats', 'glance.common.config',
                 group='image_format')
 CONF.import_opt('image_property_quota', 'glance.common.config')
 
-vgw_opts = [
-   cfg.DictOpt('vgw_url',
-                default={
-                    'fs_vgw_url': 'http://162.3.114.107:8090/',
-                    'vcloud_vgw_url': 'http://172.27.12.245:8090/',
-                    'aws_vgw_url': 'http://162.3.114.109:8090/'
-                },
-                help="These values will be used for upload/download image "
-                     "from vgw host.") 
-]
-
-CONF.register_opts(vgw_opts,'vgw')
-
 
 def validate_image_meta(req, values):
 
@@ -90,12 +74,12 @@ def validate_image_meta(req, values):
         if disk_format not in CONF.image_format.disk_formats:
             msg = _("Invalid disk format '%s' for image.") % disk_format
             raise HTTPBadRequest(explanation=msg, request=req)
-    #modified by liuling
-    #if 'container_format' in values:
-    #    if container_format not in CONF.image_format.container_formats:
-    #       msg = _("Invalid container format '%s' "
-    #                "for image.") % container_format
-    #        raise HTTPBadRequest(explanation=msg, request=req)
+
+    if 'container_format' in values:
+        if container_format not in CONF.image_format.container_formats:
+            msg = _("Invalid container format '%s' "
+                    "for image.") % container_format
+            raise HTTPBadRequest(explanation=msg, request=req)
 
     if name and len(name) > 255:
         msg = _('Image name too long: %d') % len(name)
@@ -1080,14 +1064,6 @@ class Controller(controller.BaseController):
                 # to delete the image if the backend doesn't yet store it.
                 # See https://bugs.launchpad.net/glance/+bug/747799
                 if image['location']:
-                    #reqUrl = CONF.vgw.vgw_url.get(image['container_format'])
-                    #if reqUrl:                    
-                    #    httplib.HTTPConnection._http_vsn = 10
-                    #    httplib.HTTPConnection._http_vsn_str = 'HTTP/1.0'
-                    #    r = requests.delete(reqUrl + '/' + image['id'])
-                    #    if r.status_code != 200:
-                    #        LOG.error("delete remote file error")                        
-                            
                     for loc_data in image['location_data']:
                         if loc_data['status'] == 'active':
                             upload_utils.initiate_deletion(req, loc_data, id)
