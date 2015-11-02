@@ -18,7 +18,7 @@ from oslo.utils import excutils
 from oslo.vmware.common import loopingcall
 from oslo.utils import excutils
 from nova.openstack.common import log as logging
-from nova.i18n import _, _LI, _LW
+from nova.i18n import _, _LI, _LW, _LE
 from threading import Lock
 import time
 import base64
