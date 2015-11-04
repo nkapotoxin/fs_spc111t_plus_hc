@@ -1316,7 +1316,6 @@ class AwsEc2Driver(driver.ComputeDriver):
                 LOG.warning('Failed to delete network interface %s', eth.id)
 
         # 3.2 delete volumes, if needed
-        tries = 0
         if destroy_disks:
             for vol in provider_vol_list:
                 try:
@@ -1324,22 +1323,6 @@ class AwsEc2Driver(driver.ComputeDriver):
                 except:
                     LOG.warning('Failed to delete provider vol %s', vol.id)
 
-            for cinder_vol in all_volume_ids:
-                try:
-                    volume = self.cinder_api.get(context, cinder_vol)
-                    attachment = self.cinder_api.get_volume_attachment(volume, instance['uuid'])
-                    if attachment:
-                        self.cinder_api.detach(context, cinder_vol, attachment['attachment_id'])
-                    while tries <= 3:
-                        volume = self.cinder_api.get(context, cinder_vol)
-                        if volume['status'] != 'available':
-                            time.sleep(tries ** 2)
-                            tries = tries + 1
-                        else:
-                            break
-                    self.cinder_api.delete(context, cinder_vol)
-                except:
-                    LOG.warning('Failed to delete cinder_vol vol %s', cinder_vol)
         # todo: unset volume mapping
         bdms = block_device_info.get('block_device_mapping',[])
         volume_ids = self._get_volume_ids_from_bdms(bdms)
